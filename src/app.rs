@@ -321,6 +321,7 @@ pub enum NavMenuAction {
     Preview(segmented_button::Entity),
     RunContextAction(segmented_button::Entity, usize),
     RemoveFromSidebar(segmented_button::Entity),
+    OpenInTerminal(segmented_button::Entity),
 }
 
 impl MenuAction for NavMenuAction {
@@ -2577,6 +2578,17 @@ impl Application for App {
                     fl!("open-in-new-window"),
                     None,
                     NavMenuAction::OpenInNewWindow(entity),
+                ));
+            }
+            // POP Flow: "Open in terminal" for sidebar folders.
+            if location_opt
+                .and_then(Location::path_opt)
+                .is_some_and(|p| p.is_dir())
+            {
+                items.push(cosmic::widget::menu::Item::Button(
+                    fl!("open-in-terminal"),
+                    None,
+                    NavMenuAction::OpenInTerminal(entity),
                 ));
             }
             if let Some(path) = location_opt.and_then(Location::path_opt) {
@@ -5088,6 +5100,31 @@ impl Application for App {
                         .cloned()
                     {
                         return self.open_file(&[path]);
+                    }
+                }
+                NavMenuAction::OpenInTerminal(entity) => {
+                    // POP Flow: open the default terminal at the sidebar folder,
+                    // reusing the same terminal lookup as Message::OpenTerminal.
+                    let path_opt = self
+                        .nav_model
+                        .data::<Location>(entity)
+                        .and_then(Location::path_opt)
+                        .cloned();
+                    if let Some(path) = path_opt
+                        && let Some(terminal) = self.mime_app_cache.terminal()
+                        && let Some(mut command) = terminal
+                            .command::<&str>(&[])
+                            .and_then(|v| v.into_iter().next())
+                    {
+                        command.current_dir(&path);
+                        if let Err(err) = spawn_detached(&mut command) {
+                            log::warn!(
+                                "failed to open {} in terminal {:?}: {}",
+                                path.display(),
+                                terminal.id,
+                                err
+                            );
+                        }
                     }
                 }
                 NavMenuAction::OpenWith(entity) => {
