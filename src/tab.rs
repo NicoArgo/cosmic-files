@@ -2388,7 +2388,7 @@ impl Item {
     /// while the pointer hovers the icon. Only images/SVGs get one — a bigger
     /// generic mime icon wouldn't help. Reuses the already-cached thumbnail
     /// handle (up to ~512px on disk), so nothing is regenerated.
-    fn hover_peek(&self) -> Option<Element<'_, Message>> {
+    fn hover_peek(&self) -> Option<Element<'static, Message>> {
         const PEEK: f32 = 240.0;
         match self.thumbnail_opt.as_ref()? {
             ItemThumbnail::Image(handle, _) => Some(
@@ -2405,6 +2405,21 @@ impl Item {
                     .into(),
             ),
             ItemThumbnail::NotImage | ItemThumbnail::Text(_) => None,
+        }
+    }
+
+    /// POP Flow: wrap an icon element in the hover-peek tooltip when this item
+    /// has an enlargeable thumbnail and no context menu is open; otherwise
+    /// return the icon unchanged. Shared by the grid and list views.
+    fn peek_wrap<'a>(
+        &self,
+        icon: impl Into<Element<'a, Message>>,
+        context_menu_open: bool,
+        position: widget::tooltip::Position,
+    ) -> Element<'a, Message> {
+        match self.hover_peek() {
+            Some(peek) if !context_menu_open => widget::tooltip(icon, peek, position).into(),
+            _ => icon.into(),
         }
     }
 
@@ -5797,13 +5812,11 @@ impl Tab {
                         false,
                     ));
                     // POP Flow: enlarged thumbnail peek on hover (images/SVGs only).
-                    let icon_element: Element<Message> = match item.hover_peek() {
-                        Some(peek) if self.context_menu.is_none() => {
-                            widget::tooltip(icon_button, peek, widget::tooltip::Position::Top)
-                                .into()
-                        }
-                        _ => icon_button.into(),
-                    };
+                    let icon_element = item.peek_wrap(
+                        icon_button,
+                        self.context_menu.is_some(),
+                        widget::tooltip::Position::Top,
+                    );
                     let buttons: Vec<Element<Message>> = vec![
                         icon_element,
                         widget::tooltip(
@@ -6179,10 +6192,13 @@ impl Tab {
 
                     let row = if condensed {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_size)
-                                .into(),
+                            item.peek_wrap(
+                                widget::icon::icon(item.icon_handle_list_condensed.clone())
+                                    .content_fit(ContentFit::Contain)
+                                    .size(icon_size),
+                                self.context_menu.is_some(),
+                                widget::tooltip::Position::Right,
+                            ),
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
                                 //TODO: translate?
@@ -6196,10 +6212,13 @@ impl Tab {
                         .spacing(space_xxs)
                     } else if is_search {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_size)
-                                .into(),
+                            item.peek_wrap(
+                                widget::icon::icon(item.icon_handle_list_condensed.clone())
+                                    .content_fit(ContentFit::Contain)
+                                    .size(icon_size),
+                                self.context_menu.is_some(),
+                                widget::tooltip::Position::Right,
+                            ),
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
                                 widget::text::caption(match item.path_opt() {
@@ -6222,10 +6241,13 @@ impl Tab {
                         .spacing(space_xxs)
                     } else {
                         widget::row::with_children([
-                            widget::icon::icon(item.icon_handle_list.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_size)
-                                .into(),
+                            item.peek_wrap(
+                                widget::icon::icon(item.icon_handle_list.clone())
+                                    .content_fit(ContentFit::Contain)
+                                    .size(icon_size),
+                                self.context_menu.is_some(),
+                                widget::tooltip::Position::Right,
+                            ),
                             Item::list_display_name(item.display_name.clone())
                                 .width(Length::Fill)
                                 .into(),
