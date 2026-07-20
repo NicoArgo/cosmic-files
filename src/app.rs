@@ -6192,6 +6192,47 @@ impl Application for App {
                     }
                 };
 
+                // POP Flow: preview the image being renamed, above the name field
+                // (a bit larger than the hover peek). Only for image files.
+                let is_image = !*dir
+                    && mime_guess::from_path(from.as_path())
+                        .first()
+                        .is_some_and(|m| m.type_() == mime_guess::mime::IMAGE);
+                let name_label = widget::text::body(if *dir {
+                    fl!("folder-name")
+                } else {
+                    fl!("file-name")
+                });
+                let name_field = widget::text_input("", name.as_str())
+                    .id(self.dialog_text_input.clone())
+                    .double_click_select_delimiter('.')
+                    .on_input(move |name| {
+                        Message::DialogUpdate(DialogPage::RenameItem {
+                            from: from.clone(),
+                            parent: parent.clone(),
+                            name,
+                            dir: *dir,
+                        })
+                    })
+                    .on_submit_maybe(complete_maybe.clone().map(|maybe| move |_| maybe.clone()));
+                let control = if is_image {
+                    widget::column::with_children(vec![
+                        widget::container(
+                            widget::image(widget::image::Handle::from_path(from.clone()))
+                                .content_fit(cosmic::iced::ContentFit::Contain)
+                                .width(Length::Fixed(288.0))
+                                .height(Length::Fixed(288.0)),
+                        )
+                        .center_x(Length::Fill)
+                        .into(),
+                        name_label.into(),
+                        name_field.into(),
+                    ])
+                } else {
+                    widget::column::with_children(vec![name_label.into(), name_field.into()])
+                }
+                .spacing(space_xxs);
+
                 dialog
                     .primary_action(
                         widget::button::suggested(fl!("rename-confirm"))
@@ -6200,30 +6241,7 @@ impl Application for App {
                     .secondary_action(
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
-                    .control(
-                        widget::column::with_children([
-                            widget::text::body(if *dir {
-                                fl!("folder-name")
-                            } else {
-                                fl!("file-name")
-                            })
-                            .into(),
-                            widget::text_input("", name.as_str())
-                                .id(self.dialog_text_input.clone())
-                                .double_click_select_delimiter('.')
-                                .on_input(move |name| {
-                                    Message::DialogUpdate(DialogPage::RenameItem {
-                                        from: from.clone(),
-                                        parent: parent.clone(),
-                                        name,
-                                        dir: *dir,
-                                    })
-                                })
-                                .on_submit_maybe(complete_maybe.map(|maybe| move |_| maybe.clone()))
-                                .into(),
-                        ])
-                        .spacing(space_xxs),
-                    )
+                    .control(control)
             }
             DialogPage::Replace {
                 from,
