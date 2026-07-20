@@ -5815,7 +5815,7 @@ impl Tab {
                     let icon_element = item.peek_wrap(
                         icon_button,
                         self.context_menu.is_some(),
-                        widget::tooltip::Position::Top,
+                        widget::tooltip::Position::FollowCursor,
                     );
                     let buttons: Vec<Element<Message>> = vec![
                         icon_element,
@@ -6197,7 +6197,7 @@ impl Tab {
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size),
                                 self.context_menu.is_some(),
-                                widget::tooltip::Position::Right,
+                                widget::tooltip::Position::FollowCursor,
                             ),
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
@@ -6217,7 +6217,7 @@ impl Tab {
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size),
                                 self.context_menu.is_some(),
-                                widget::tooltip::Position::Right,
+                                widget::tooltip::Position::FollowCursor,
                             ),
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
@@ -6246,7 +6246,7 @@ impl Tab {
                                     .content_fit(ContentFit::Contain)
                                     .size(icon_size),
                                 self.context_menu.is_some(),
-                                widget::tooltip::Position::Right,
+                                widget::tooltip::Position::FollowCursor,
                             ),
                             Item::list_display_name(item.display_name.clone())
                                 .width(Length::Fill)
