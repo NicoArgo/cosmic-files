@@ -2384,6 +2384,30 @@ impl Item {
         }
     }
 
+    /// POP Flow: a larger "peek" of this item's thumbnail, shown in a tooltip
+    /// while the pointer hovers the icon. Only images/SVGs get one — a bigger
+    /// generic mime icon wouldn't help. Reuses the already-cached thumbnail
+    /// handle (up to ~512px on disk), so nothing is regenerated.
+    fn hover_peek(&self) -> Option<Element<'_, Message>> {
+        const PEEK: f32 = 240.0;
+        match self.thumbnail_opt.as_ref()? {
+            ItemThumbnail::Image(handle, _) => Some(
+                widget::image(handle.clone())
+                    .content_fit(ContentFit::Contain)
+                    .width(Length::Fixed(PEEK))
+                    .height(Length::Fixed(PEEK))
+                    .into(),
+            ),
+            ItemThumbnail::Svg(handle) => Some(
+                widget::svg(handle.clone())
+                    .width(Length::Fixed(PEEK))
+                    .height(Length::Fixed(PEEK))
+                    .into(),
+            ),
+            ItemThumbnail::NotImage | ItemThumbnail::Text(_) => None,
+        }
+    }
+
     pub fn preview_actions(&self) -> Element<'_, Message> {
         let mut row = widget::row::with_capacity(3)
             .align_y(Alignment::Center)
@@ -5758,22 +5782,30 @@ impl Tab {
                 // Only build elements if visible (for performance)
                 if item_rect.intersects(&visible_rect) {
                     //TODO: one focus group per grid item (needs custom widget)
+                    let icon_button = widget::button::custom(
+                        widget::icon::icon(item.icon_handle_grid.clone())
+                            .content_fit(ContentFit::Contain)
+                            .size(icon_sizes.grid()),
+                    )
+                    .padding(space_xxxs)
+                    .class(button_style(
+                        item.selected,
+                        item.highlighted,
+                        item.cut,
+                        false,
+                        false,
+                        false,
+                    ));
+                    // POP Flow: enlarged thumbnail peek on hover (images/SVGs only).
+                    let icon_element: Element<Message> = match item.hover_peek() {
+                        Some(peek) if self.context_menu.is_none() => {
+                            widget::tooltip(icon_button, peek, widget::tooltip::Position::Top)
+                                .into()
+                        }
+                        _ => icon_button.into(),
+                    };
                     let buttons: Vec<Element<Message>> = vec![
-                        widget::button::custom(
-                            widget::icon::icon(item.icon_handle_grid.clone())
-                                .content_fit(ContentFit::Contain)
-                                .size(icon_sizes.grid()),
-                        )
-                        .padding(space_xxxs)
-                        .class(button_style(
-                            item.selected,
-                            item.highlighted,
-                            item.cut,
-                            false,
-                            false,
-                            false,
-                        ))
-                        .into(),
+                        icon_element,
                         widget::tooltip(
                             widget::button::custom(Item::grid_display_name(&item.display_name))
                                 .id(item.button_id.clone())
