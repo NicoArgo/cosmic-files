@@ -210,6 +210,8 @@ impl Config {
             military_time: self.tab.military_time,
             show_hidden: self.dialog.show_hidden,
             single_click: false,
+            tree_click_expands: false,
+            tree_remember: false,
             view: self.dialog.view,
         }
     }
@@ -331,6 +333,10 @@ pub struct TabConfig {
     pub show_hidden: bool,
     /// Single click to open
     pub single_click: bool,
+    /// Left clicking a folder row also expands it in the list view
+    pub tree_click_expands: bool,
+    /// Keep expanded folders when navigating away and back
+    pub tree_remember: bool,
     /// Selected view, grid or list
     pub view: View,
 }
@@ -343,6 +349,8 @@ impl Default for TabConfig {
             military_time: false,
             show_hidden: false,
             single_click: false,
+            tree_click_expands: false,
+            tree_remember: true,
             view: View::List,
         }
     }

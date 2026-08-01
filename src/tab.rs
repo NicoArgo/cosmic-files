@@ -26,7 +26,7 @@ use icu::locale::preferences::extensions::unicode::keywords::HourCycle;
 use image::{DynamicImage, ImageReader};
 use jiff_icu::ConvertFrom;
 use mime_guess::{Mime, mime};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -739,6 +739,8 @@ pub fn item_from_gvfs_info(path: PathBuf, file_info: gio::FileInfo, sizes: IconS
         dir_size,
         cut: false,
         checksums: ChecksumState::default(),
+        depth: 0,
+        tree_parent: None,
     }
 }
 
@@ -871,6 +873,8 @@ pub fn item_from_entry(
         dir_size,
         cut: false,
         checksums: ChecksumState::default(),
+        depth: 0,
+        tree_parent: None,
     }
 }
 
@@ -930,6 +934,8 @@ pub fn item_from_trash_entry(
         dir_size: DirSize::NotDirectory,
         cut: false,
         checksums: ChecksumState::default(),
+        depth: 0,
+        tree_parent: None,
     }
 }
 
@@ -1384,6 +1390,8 @@ pub fn scan_desktop(
             dir_size: DirSize::NotDirectory,
             cut: false,
             checksums: ChecksumState::default(),
+            depth: 0,
+            tree_parent: None,
         });
     }
 
@@ -1716,6 +1724,10 @@ pub enum Command {
     Delete(Vec<PathBuf>),
     DropFiles(PathBuf, ClipboardPaste),
     ClearRecents,
+    /// Scan these folders so their rows can be shown inline, shallowest first.
+    ExpandFolders(Vec<PathBuf>),
+    /// Folders were collapsed; the file watcher needs to be brought up to date.
+    TreeChanged,
     EmptyTrash,
     #[cfg(feature = "desktop")]
     ExecEntryAction(cosmic::desktop::DesktopEntryData, usize),
@@ -1794,6 +1806,8 @@ pub enum Message {
     TabComplete(PathBuf, Vec<(String, PathBuf)>),
     Thumbnail(PathBuf, ItemThumbnail),
     ToggleSort(HeadingOptions),
+    /// Expand or collapse the folder at this index in the list view.
+    ToggleExpand(usize),
     Drop(Option<(Location, ClipboardPaste)>),
     DndHover(Location),
     DndEnter(Location),
@@ -2304,6 +2318,13 @@ pub struct Item {
     pub overlaps_drag_rect: bool,
     pub dir_size: DirSize,
     pub checksums: ChecksumState,
+    /// Indentation level in the expandable list view. 0 for entries of the tab's
+    /// own directory, 1 for the children of an expanded folder, and so on.
+    pub depth: u16,
+    /// Path of the expanded folder this item was scanned from, `None` at depth 0.
+    /// Used instead of an index because indices shift as rows are added and
+    /// removed, while paths stay valid.
+    pub tree_parent: Option<PathBuf>,
 }
 
 impl Item {
@@ -2828,6 +2849,12 @@ pub struct Tab {
     pub gallery: bool,
     pub(crate) parent_item_opt: Option<Box<Item>>,
     pub(crate) items_opt: Option<Vec<Item>>,
+    /// Folders currently expanded inline in the list view, by absolute path.
+    /// This is the intent, `items_opt` is the derived rendering: it survives
+    /// rescans (which replace `items_opt` wholesale) and, unless
+    /// `tree_remember` is off, navigation as well, so coming back to a
+    /// directory reopens the folders that were open before.
+    pub(crate) expanded: FxHashSet<PathBuf>,
     pub dnd_hovered: Option<(Location, Instant)>,
     pub(crate) scrollable_id: widget::Id,
     select_focus: Option<usize>,
@@ -2975,6 +3002,7 @@ impl Tab {
             gallery: false,
             parent_item_opt: None,
             items_opt: None,
+            expanded: FxHashSet::default(),
             scrollable_id,
             select_focus: None,
             select_range: None,
@@ -3026,6 +3054,151 @@ impl Tab {
         {
             i.highlighted = true;
         }
+    }
+
+    /// Whether folders can be expanded inline. Only the list view of a real
+    /// directory has a hierarchy worth showing; search results, trash and
+    /// recents are flat by nature, and the grid has nowhere to put the rows.
+    pub fn tree_enabled(&self) -> bool {
+        matches!(self.config.view, View::List)
+            && !matches!(self.mode, Mode::Desktop)
+            && matches!(self.location, Location::Path(_))
+    }
+
+    /// Expanded folders that live under this tab's location, shallowest first.
+    /// These are the folders whose children need to be scanned, and the extra
+    /// paths the file watcher has to keep an eye on.
+    pub fn tree_scan_paths(&self) -> Vec<PathBuf> {
+        if !self.tree_enabled() {
+            return Vec::new();
+        }
+        let Some(root) = self.location.path_opt() else {
+            return Vec::new();
+        };
+        let mut paths: Vec<_> = self
+            .expanded
+            .iter()
+            .filter(|path| path.starts_with(root) && path.as_path() != root)
+            .cloned()
+            .collect();
+        paths.sort_by_key(|path| path.components().count());
+        paths
+    }
+
+    /// Depth of the rows scanned out of `parent`, counted from this tab's own
+    /// directory. Derived from the path so it stays correct even if the parent
+    /// row has not been rendered yet.
+    fn tree_depth_of_children(&self, parent: &Path) -> u16 {
+        self.location
+            .path_opt()
+            .and_then(|root| parent.strip_prefix(root).ok())
+            .map_or(1, |rel| rel.components().count().clamp(1, u16::MAX as usize) as u16)
+    }
+
+    /// Expand or collapse `path`, returning the folders whose children must be
+    /// scanned. Collapsing keeps the descendants in `expanded` so reopening a
+    /// folder restores the sub-tree the user had built.
+    fn set_expanded(&mut self, path: PathBuf, expanded: bool) -> Vec<PathBuf> {
+        if expanded {
+            self.expanded.insert(path.clone());
+            // Descendants may still be marked expanded from an earlier session
+            // of this tab; scan them too so the whole sub-tree comes back.
+            let mut paths = vec![path.clone()];
+            paths.extend(
+                self.expanded
+                    .iter()
+                    .filter(|p| p.as_path() != path && p.starts_with(&path))
+                    .cloned(),
+            );
+            paths.sort_by_key(|p| p.components().count());
+            paths
+        } else {
+            self.expanded.remove(&path);
+            if let Some(items) = &mut self.items_opt {
+                items.retain(|item| {
+                    item.tree_parent
+                        .as_deref()
+                        .is_none_or(|parent| parent != path && !parent.starts_with(&path))
+                });
+            }
+            // Removing rows shifts every index after them, so drop the state
+            // that is keyed by index rather than by location.
+            self.select_focus = None;
+            self.select_range = None;
+            self.clicked = None;
+            self.last_right_click = None;
+            Vec::new()
+        }
+    }
+
+    /// Toggle the folder at `index`, returning the commands that fetch its rows
+    /// or bring the file watcher up to date.
+    fn toggle_expand(&mut self, index: usize) -> Vec<Command> {
+        if !self.tree_enabled() {
+            return Vec::new();
+        }
+        let Some(path) = self
+            .items_opt
+            .as_ref()
+            .and_then(|items| items.get(index))
+            .filter(|item| item.metadata.is_dir())
+            .and_then(|item| item.path_opt().cloned())
+        else {
+            return Vec::new();
+        };
+        let expand = !self.expanded.contains(&path);
+        let to_scan = self.set_expanded(path, expand);
+        if to_scan.is_empty() {
+            vec![Command::TreeChanged]
+        } else {
+            vec![Command::ExpandFolders(to_scan)]
+        }
+    }
+
+    /// Right expands the focused folder and Left collapses it. Returns `None`
+    /// when there is nothing to do, so the caller can fall back to moving the
+    /// selection as it always did.
+    fn tree_arrow(&mut self, expand: bool) -> Option<Vec<Command>> {
+        if !self.tree_enabled() {
+            return None;
+        }
+        let index = self.select_focus?;
+        let item = self.items_opt.as_ref()?.get(index)?;
+        if !item.metadata.is_dir() {
+            return None;
+        }
+        let path = item.path_opt()?.clone();
+        if self.expanded.contains(&path) == expand {
+            return None;
+        }
+        Some(self.toggle_expand(index))
+    }
+
+    /// Splice the freshly scanned children of `parent` into the flat item list.
+    /// Rows are appended rather than inserted so existing indices — which
+    /// pending click messages still refer to — stay valid; the hierarchy is
+    /// rebuilt by [`Self::column_sort`] instead of by storage order.
+    pub fn set_tree_children(&mut self, parent: &Path, mut children: Vec<Item>) {
+        if !self.expanded.contains(parent) {
+            // Collapsed again while the scan was in flight.
+            return;
+        }
+        let depth = self.tree_depth_of_children(parent);
+        let selected = self.selected_locations();
+        for child in &mut children {
+            child.depth = depth;
+            child.tree_parent = Some(parent.to_path_buf());
+            child.selected = child
+                .location_opt
+                .as_ref()
+                .is_some_and(|location| selected.contains(location));
+        }
+        let Some(items) = &mut self.items_opt else {
+            return;
+        };
+        // Drop a previous scan of the same folder so repeated scans are a no-op.
+        items.retain(|item| item.tree_parent.as_deref() != Some(parent));
+        items.append(&mut children);
     }
 
     pub fn cut_selected(&mut self) {
@@ -3501,6 +3674,11 @@ impl Tab {
         self.context_menu = None;
         self.edit_location = None;
         self.items_opt = None;
+        // The expanded set is keyed by absolute path, so leaving it alone is
+        // what makes a directory come back with its folders still open.
+        if !self.config.tree_remember {
+            self.expanded.clear();
+        }
         //TODO: remember scroll by location?
         self.scroll_opt = None;
         self.select_focus = None;
@@ -3737,6 +3915,17 @@ impl Tab {
                         }
                     }
                 }
+
+                // Optionally let a plain left click open the folder inline as
+                // well. Selection above still happens, so the folder can be
+                // copied or dragged in the same gesture.
+                if self.config.tree_click_expands
+                    && !mod_ctrl
+                    && !mod_shift
+                    && let Some(click_i) = click_i_opt
+                {
+                    commands.append(&mut self.toggle_expand(click_i));
+                }
             }
             Message::Config(config) => {
                 // View is preserved for existing tabs
@@ -3756,6 +3945,13 @@ impl Tab {
                         self.config.show_hidden,
                         Instant::now(),
                     ));
+                }
+                // Forgetting expansions is the whole point of the setting, so
+                // drop everything outside this directory as soon as it is off.
+                if !self.config.tree_remember {
+                    let root = self.location.path_opt().cloned();
+                    self.expanded
+                        .retain(|path| root.as_ref().is_some_and(|root| path.starts_with(root)));
                 }
                 // Unhighlight all items when config changes
                 if let Some(ref mut items) = self.items_opt {
@@ -4155,6 +4351,8 @@ impl Tab {
                 self.dehighlight_all();
                 if self.gallery {
                     commands.append(&mut self.update(Message::GalleryPrevious, modifiers));
+                } else if let Some(mut tree_commands) = self.tree_arrow(false) {
+                    commands.append(&mut tree_commands);
                 } else {
                     if let Some((row, col)) =
                         self.select_focus_pos_opt().or(self.select_first_pos_opt())
@@ -4214,6 +4412,8 @@ impl Tab {
                 self.dehighlight_all();
                 if self.gallery {
                     commands.append(&mut self.update(Message::GalleryNext, modifiers));
+                } else if let Some(mut tree_commands) = self.tree_arrow(true) {
+                    commands.append(&mut tree_commands);
                 } else {
                     if let Some((row, col)) =
                         self.select_focus_pos_opt().or(self.select_last_pos_opt())
@@ -4747,6 +4947,9 @@ impl Tab {
                     self.sort_name = heading_option;
                 }
             }
+            Message::ToggleExpand(i) => {
+                commands.append(&mut self.toggle_expand(i));
+            }
             Message::Drop(Some((to, mut from))) => {
                 self.dnd_hovered = None;
                 match to {
@@ -4960,7 +5163,49 @@ impl Tab {
         }
     }
 
+    /// Items in display order. With the tree enabled the rows of each expanded
+    /// folder follow their parent, and the chosen sort applies within every set
+    /// of siblings rather than across the whole flat list.
     fn column_sort(&self) -> Option<Vec<(usize, &Item)>> {
+        let items = self.sort_indexed()?;
+        if !self.tree_enabled() {
+            return Some(items);
+        }
+
+        // Bucket the sorted rows by the folder they were scanned from, then
+        // walk depth-first from the tab's own entries. Rows whose parent is
+        // gone are simply never reached, so a scan that outlives a collapse
+        // cannot leak orphans into the view.
+        let mut children: FxHashMap<&Path, Vec<(usize, &Item)>> = FxHashMap::default();
+        let mut stack = Vec::new();
+        for entry in items {
+            match entry.1.tree_parent.as_deref() {
+                Some(parent) => children.entry(parent).or_default().push(entry),
+                None => stack.push(entry),
+            }
+        }
+        stack.reverse();
+
+        let mut sorted = Vec::with_capacity(stack.len() + children.len());
+        while let Some(entry) = stack.pop() {
+            sorted.push(entry);
+            // A hidden folder's rows stay out of sight along with it, but the
+            // folder itself is still emitted so `list_view` can count it.
+            if entry.1.hidden && !self.config.show_hidden {
+                continue;
+            }
+            if let Some(path) = entry.1.path_opt()
+                && self.expanded.contains(path)
+                && let Some(kids) = children.remove(path.as_path())
+            {
+                stack.extend(kids.into_iter().rev());
+            }
+        }
+        Some(sorted)
+    }
+
+    /// The flat list of items in sort order, ignoring any hierarchy.
+    fn sort_indexed(&self) -> Option<Vec<(usize, &Item)>> {
         let check_reverse = |ord: Ordering, sort: bool| {
             if sort { ord } else { ord.reverse() }
         };
@@ -5773,6 +6018,14 @@ impl Tab {
             let mut hidden = 0;
             let mut grid_elements = Vec::new();
             for &(i, item) in &items {
+                // The grid has no room for a hierarchy, so rows belonging to a
+                // folder expanded in the list view are left out here. They stay
+                // in `items_opt` so switching back to the list restores them.
+                if item.tree_parent.is_some() {
+                    item.pos_opt.set(None);
+                    item.rect_opt.set(None);
+                    continue;
+                }
                 if !show_hidden && item.hidden {
                     item.pos_opt.set(None);
                     item.rect_opt.set(None);
@@ -6041,7 +6294,10 @@ impl Tab {
         bool,
     ) {
         let cosmic_theme::Spacing {
-            space_s, space_xxs, ..
+            space_s,
+            space_xxs,
+            space_xxxs,
+            ..
         } = theme::spacing();
 
         let TabConfig {
@@ -6057,6 +6313,23 @@ impl Tab {
         let size_width = 100.0;
         let condensed = size.width < (name_width + modified_width + size_width);
         let is_search = matches!(self.location, Location::Search(..));
+
+        let tree_enabled = self.tree_enabled();
+        // Width of the disclosure chevron, reserved for files too so that names
+        // line up with the folders around them.
+        let chevron_size = 16.0;
+        let chevron_width = chevron_size + 2.0 * f32::from(space_xxxs);
+        let tree_indent = chevron_width;
+        // Rows the tree does not emit — children of a folder that was collapsed,
+        // or of one whose scan outlived it — must not keep a stale position, or
+        // keyboard navigation and thumbnail loading would still count them as
+        // being on screen.
+        if tree_enabled && let Some(items) = &self.items_opt {
+            for item in items {
+                item.pos_opt.set(None);
+                item.rect_opt.set(None);
+            }
+        }
         let icon_size = if condensed || is_search {
             icon_sizes.list_condensed()
         } else {
@@ -6190,15 +6463,54 @@ impl Tab {
                         },
                     };
 
-                    let row = if condensed {
+                    // Indentation for this row's depth, followed by a disclosure
+                    // chevron on folders that have something to show.
+                    let tree_prefix: Option<Element<'_, Message>> = tree_enabled.then(|| {
+                        let expandable = item.metadata.is_dir()
+                            && item.path_opt().is_some()
+                            && item.metadata.children_count() != Some(&0);
+                        let chevron: Element<'_, Message> = if expandable {
+                            let is_expanded = item
+                                .path_opt()
+                                .is_some_and(|path| self.expanded.contains(path));
+                            widget::button::custom(
+                                widget::icon::from_name(if is_expanded {
+                                    "pan-down-symbolic"
+                                } else {
+                                    "pan-end-symbolic"
+                                })
+                                .size(chevron_size as u16),
+                            )
+                            .padding(space_xxxs)
+                            .class(theme::Button::Icon)
+                            .on_press(Message::ToggleExpand(i))
+                            .into()
+                        } else {
+                            space::horizontal()
+                                .width(Length::Fixed(chevron_width))
+                                .into()
+                        };
                         widget::row::with_children([
-                            item.peek_wrap(
-                                widget::icon::icon(item.icon_handle_list_condensed.clone())
-                                    .content_fit(ContentFit::Contain)
-                                    .size(icon_size),
-                                self.context_menu.is_some(),
-                                widget::tooltip::Position::FollowCursor,
-                            ),
+                            space::horizontal()
+                                .width(Length::Fixed(f32::from(item.depth) * tree_indent))
+                                .into(),
+                            chevron,
+                        ])
+                        .align_y(Alignment::Center)
+                        .into()
+                    });
+
+                    let row = if condensed {
+                        let mut children = Vec::with_capacity(3);
+                        children.extend(tree_prefix);
+                        children.push(item.peek_wrap(
+                            widget::icon::icon(item.icon_handle_list_condensed.clone())
+                                .content_fit(ContentFit::Contain)
+                                .size(icon_size),
+                            self.context_menu.is_some(),
+                            widget::tooltip::Position::FollowCursor,
+                        ));
+                        children.push(
                             widget::column::with_children([
                                 Item::list_display_name(item.display_name.clone()).into(),
                                 //TODO: translate?
@@ -6206,10 +6518,11 @@ impl Tab {
                                     .into(),
                             ])
                             .into(),
-                        ])
-                        .height(Length::Fixed(f32::from(row_height)))
-                        .align_y(Alignment::Center)
-                        .spacing(space_xxs)
+                        );
+                        widget::row::with_children(children)
+                            .height(Length::Fixed(f32::from(row_height)))
+                            .align_y(Alignment::Center)
+                            .spacing(space_xxs)
                     } else if is_search {
                         widget::row::with_children([
                             item.peek_wrap(
@@ -6240,27 +6553,34 @@ impl Tab {
                         .align_y(Alignment::Center)
                         .spacing(space_xxs)
                     } else {
-                        widget::row::with_children([
-                            item.peek_wrap(
-                                widget::icon::icon(item.icon_handle_list.clone())
-                                    .content_fit(ContentFit::Contain)
-                                    .size(icon_size),
-                                self.context_menu.is_some(),
-                                widget::tooltip::Position::FollowCursor,
-                            ),
+                        let mut children = Vec::with_capacity(5);
+                        children.extend(tree_prefix);
+                        children.push(item.peek_wrap(
+                            widget::icon::icon(item.icon_handle_list.clone())
+                                .content_fit(ContentFit::Contain)
+                                .size(icon_size),
+                            self.context_menu.is_some(),
+                            widget::tooltip::Position::FollowCursor,
+                        ));
+                        children.push(
                             Item::list_display_name(item.display_name.clone())
                                 .width(Length::Fill)
                                 .into(),
+                        );
+                        children.push(
                             widget::text::body(modified_text.clone())
                                 .width(Length::Fixed(modified_width))
                                 .into(),
+                        );
+                        children.push(
                             widget::text::body(size_text.clone())
                                 .width(Length::Fixed(size_width))
                                 .into(),
-                        ])
-                        .height(Length::Fixed(f32::from(row_height)))
-                        .align_y(Alignment::Center)
-                        .spacing(space_xxs)
+                        );
+                        widget::row::with_children(children)
+                            .height(Length::Fixed(f32::from(row_height)))
+                            .align_y(Alignment::Center)
+                            .spacing(space_xxs)
                     };
 
                     let button = |row| {
@@ -7445,7 +7765,8 @@ mod tests {
     use test_log::test;
 
     use super::{
-        ItemMetadata, ItemThumbnail, Location, Message, Tab, respond_to_scroll_direction, scan_path,
+        Command, HeadingOptions, ItemMetadata, ItemThumbnail, Location, Message, Tab, View,
+        respond_to_scroll_direction, scan_path,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -7947,6 +8268,170 @@ mod tests {
                 thumb
             ),
         }
+        Ok(())
+    }
+
+    /// A list-view tab on a populated directory, plus one of its subdirectories.
+    fn tree_tab() -> io::Result<(TempDir, Tab, PathBuf, usize)> {
+        let fs = simple_fs(NUM_FILES, NUM_HIDDEN, NUM_DIRS, NUM_NESTED, NAME_LEN)?;
+        let path = fs.path().to_path_buf();
+        let mut tab = Tab::new(
+            Location::Path(path.clone()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        tab.set_items(scan_path(&path, IconSizes::default()));
+
+        let dir = read_dir_sorted(&path)?
+            .into_iter()
+            .find(|entry| entry.is_dir())
+            .expect("fixture should contain a directory");
+        let children = scan_path(&dir, IconSizes::default()).len();
+        assert!(children > 0, "fixture directory should not be empty");
+
+        Ok((fs, tab, dir, children))
+    }
+
+    fn tab_index_of(tab: &Tab, path: &std::path::Path) -> usize {
+        tab.items_opt()
+            .expect("tab should have items")
+            .iter()
+            .position(|item| item.path_opt().map(PathBuf::as_path) == Some(path))
+            .expect("path should be in the tab")
+    }
+
+    fn display_position(tab: &Tab, path: &std::path::Path) -> usize {
+        tab.column_sort()
+            .expect("tab should have items")
+            .iter()
+            .position(|(_, item)| item.path_opt().map(PathBuf::as_path) == Some(path))
+            .expect("path should be displayed")
+    }
+
+    /// Only the tree commands, dropping the scroll and focus tasks that
+    /// `Tab::update` adds on its own.
+    fn tree_commands(commands: &[Command]) -> Vec<&Command> {
+        commands
+            .iter()
+            .filter(|command| matches!(command, Command::ExpandFolders(_) | Command::TreeChanged))
+            .collect()
+    }
+
+    /// Expand a folder and hand it the rows the app would have scanned.
+    fn expand(tab: &mut Tab, dir: &PathBuf) -> Vec<Command> {
+        let index = tab_index_of(tab, dir);
+        let commands = tab.update(Message::ToggleExpand(index), Modifiers::empty());
+        tab.set_tree_children(dir, scan_path(dir, IconSizes::default()));
+        commands
+    }
+
+    #[test]
+    fn tree_expand_puts_children_under_their_parent() -> io::Result<()> {
+        let (_fs, mut tab, dir, children) = tree_tab()?;
+
+        let commands = expand(&mut tab, &dir);
+        let tree = tree_commands(&commands);
+        assert!(
+            matches!(tree.as_slice(), [Command::ExpandFolders(paths)] if paths.as_slice() == [dir.clone()]),
+            "expanding should ask for exactly that folder's rows, got {tree:?}"
+        );
+
+        let sorted = tab.column_sort().expect("tab should have items");
+        let parent_at = display_position(&tab, &dir);
+        for offset in 1..=children {
+            let (_, item) = sorted[parent_at + offset];
+            assert_eq!(item.tree_parent.as_deref(), Some(dir.as_path()));
+            assert_eq!(item.depth, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tree_collapse_drops_the_child_rows() -> io::Result<()> {
+        let (_fs, mut tab, dir, children) = tree_tab()?;
+        let before = tab.items_opt().expect("tab should have items").len();
+
+        expand(&mut tab, &dir);
+        assert_eq!(
+            tab.items_opt().expect("tab should have items").len(),
+            before + children
+        );
+
+        let index = tab_index_of(&tab, &dir);
+        let commands = tab.update(Message::ToggleExpand(index), Modifiers::empty());
+        let tree = tree_commands(&commands);
+        assert!(
+            matches!(tree.as_slice(), [Command::TreeChanged]),
+            "collapsing only needs the watcher refreshed, got {tree:?}"
+        );
+        assert_eq!(
+            tab.items_opt().expect("tab should have items").len(),
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_children_follow_their_parent_through_a_sort_change() -> io::Result<()> {
+        let (_fs, mut tab, dir, _children) = tree_tab()?;
+        expand(&mut tab, &dir);
+
+        // Flip to descending; a flat sort would scatter the children away.
+        tab.update(
+            Message::ToggleSort(HeadingOptions::Name),
+            Modifiers::empty(),
+        );
+
+        let sorted = tab.column_sort().expect("tab should have items");
+        let parent_at = display_position(&tab, &dir);
+        let (_, first_child) = sorted[parent_at + 1];
+        assert_eq!(first_child.tree_parent.as_deref(), Some(dir.as_path()));
+        Ok(())
+    }
+
+    #[test]
+    fn tree_is_list_view_only() -> io::Result<()> {
+        let (_fs, mut tab, dir, _children) = tree_tab()?;
+        tab.config.view = View::Grid;
+
+        let index = tab_index_of(&tab, &dir);
+        let commands = tab.update(Message::ToggleExpand(index), Modifiers::empty());
+        assert!(
+            tree_commands(&commands).is_empty(),
+            "grid view has nowhere to put the rows"
+        );
+        assert!(tab.expanded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tree_expansion_survives_leaving_and_coming_back() -> io::Result<()> {
+        let (_fs, mut tab, dir, _children) = tree_tab()?;
+        expand(&mut tab, &dir);
+
+        let home = tab.location.clone();
+        tab.change_location(&Location::Path(dir.clone()), None);
+        tab.change_location(&home, None);
+
+        assert!(tab.expanded.contains(&dir));
+        assert_eq!(tab.tree_scan_paths(), vec![dir]);
+        Ok(())
+    }
+
+    #[test]
+    fn tree_expansion_is_forgotten_when_the_setting_is_off() -> io::Result<()> {
+        let (_fs, mut tab, dir, _children) = tree_tab()?;
+        expand(&mut tab, &dir);
+        tab.config.tree_remember = false;
+
+        let home = tab.location.clone();
+        tab.change_location(&Location::Path(dir.clone()), None);
+        tab.change_location(&home, None);
+
+        assert!(tab.expanded.is_empty());
         Ok(())
     }
 }

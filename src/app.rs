@@ -193,6 +193,8 @@ pub enum Action {
     ToggleFoldersFirst,
     ToggleShowHidden,
     ToggleSort(HeadingOptions),
+    ToggleTreeClickExpands,
+    ToggleTreeRemember,
     WindowClose,
     WindowNew,
     ZoomDefault,
@@ -274,6 +276,8 @@ impl Action {
             Self::ToggleSort(sort) => {
                 Message::TabMessage(entity_opt, tab::Message::ToggleSort(*sort))
             }
+            Self::ToggleTreeClickExpands => Message::ToggleTreeClickExpands,
+            Self::ToggleTreeRemember => Message::ToggleTreeRemember,
             Self::WindowClose => Message::WindowClose,
             Self::WindowNew => Message::WindowNew,
             Self::ZoomDefault => Message::ZoomDefault(entity_opt),
@@ -454,11 +458,15 @@ pub enum Message {
         Vec<tab::Item>,
         Option<Vec<PathBuf>>,
     ),
+    /// Rows scanned for a folder expanded inline in the list view.
+    TabTreeExpanded(Entity, PathBuf, Vec<tab::Item>),
     TabView(Option<Entity>, tab::View),
     TimeConfigChange(TimeConfig),
     ToggleContextPage(ContextPage),
     ToggleFoldersFirst,
     ToggleShowHidden,
+    ToggleTreeClickExpands,
+    ToggleTreeRemember,
     Undo(usize),
     UndoTrash(widget::ToastId, Arc<[PathBuf]>),
     UndoTrashStart(Vec<TrashItem>),
@@ -1549,6 +1557,33 @@ impl App {
         })
     }
 
+    /// Scan the folders expanded inline in `entity`'s list view. Each folder is
+    /// scanned on its own so its rows appear as soon as they are ready instead
+    /// of waiting on the deepest one.
+    fn scan_tree_folders(
+        entity: Entity,
+        paths: Vec<PathBuf>,
+        icon_sizes: crate::config::IconSizes,
+    ) -> Task<Message> {
+        if paths.is_empty() {
+            return Task::none();
+        }
+        Task::batch(paths.into_iter().map(move |path| {
+            Task::future(async move {
+                let scan_path = path.clone();
+                match tokio::task::spawn_blocking(move || tab::scan_path(&scan_path, icon_sizes))
+                    .await
+                {
+                    Ok(items) => cosmic::action::app(Message::TabTreeExpanded(entity, path, items)),
+                    Err(err) => {
+                        log::warn!("failed to scan {}: {}", path.display(), err);
+                        cosmic::action::none()
+                    }
+                }
+            })
+        }))
+    }
+
     fn rescan_trash(&mut self) -> Task<Message> {
         let needs_reload: Box<[_]> = self
             .tab_model
@@ -1900,13 +1935,23 @@ impl App {
 
     fn update_watcher(&mut self) -> Task<Message> {
         if let Some((mut watcher, old_paths)) = self.watcher_opt.take() {
+            // Folders expanded inline are watched alongside the tab's own
+            // directory: the watch is not recursive, so without this a change
+            // inside an open folder would go unnoticed.
             let new_paths: FxHashSet<_> = self
                 .tab_model
                 .iter()
                 .filter_map(|entity| {
                     let tab = self.tab_model.data::<Tab>(entity)?;
-                    tab.location.path_opt().cloned()
+                    Some(
+                        tab.location
+                            .path_opt()
+                            .cloned()
+                            .into_iter()
+                            .chain(tab.tree_scan_paths()),
+                    )
                 })
+                .flatten()
                 .collect();
 
             // Unwatch paths no longer used
@@ -4452,6 +4497,16 @@ impl Application for App {
                 config.show_hidden = !config.show_hidden;
                 return self.update(Message::TabConfig(config));
             }
+            Message::ToggleTreeClickExpands => {
+                let mut config = self.config.tab;
+                config.tree_click_expands = !config.tree_click_expands;
+                return self.update(Message::TabConfig(config));
+            }
+            Message::ToggleTreeRemember => {
+                let mut config = self.config.tab;
+                config.tree_remember = !config.tree_remember;
+                return self.update(Message::TabConfig(config));
+            }
             Message::TabMessage(entity_opt, tab_message) => {
                 let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
 
@@ -4606,6 +4661,14 @@ impl Application for App {
                                 Some(EMPTY_TRASH_BUTTON_ID.clone()),
                             );
                         }
+                        tab::Command::ExpandFolders(paths) => {
+                            let icon_sizes = self.config.tab.icon_sizes;
+                            commands.push(Self::scan_tree_folders(entity, paths, icon_sizes));
+                            commands.push(self.update_watcher());
+                        }
+                        tab::Command::TreeChanged => {
+                            commands.push(self.update_watcher());
+                        }
                         #[cfg(feature = "desktop")]
                         tab::Command::ExecEntryAction(entry, action) => {
                             Self::exec_entry_action(&entry, action);
@@ -4746,6 +4809,7 @@ impl Application for App {
             }
             Message::TabRescan(entity, mut location, parent_item_opt, items, selection_paths) => {
                 location = location.normalize();
+                let icon_sizes = self.config.tab.icon_sizes;
                 if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
                     tab.location = tab.location.normalize();
                     if location == tab.location {
@@ -4762,7 +4826,7 @@ impl Application for App {
                         tab.sort_name = sort.0;
                         tab.sort_direction = sort.1;
 
-                        let mut tasks = Vec::with_capacity(2);
+                        let mut tasks = Vec::with_capacity(3);
 
                         if let Some(selection_paths) = selection_paths {
                             tab.select_paths(selection_paths);
@@ -4773,6 +4837,12 @@ impl Application for App {
                                 tab::Message::ScrollToFocused,
                             ))));
                         }
+
+                        // `set_items` replaced the whole list, so the rows of
+                        // every folder the user had open are gone. The expanded
+                        // set survived, so scan them again to put them back.
+                        let tree_paths = tab.tree_scan_paths();
+                        tasks.push(Self::scan_tree_folders(entity, tree_paths, icon_sizes));
 
                         tasks.push(clipboard::read_data::<ClipboardPaste>().map(|p| {
                             cosmic::action::app(Message::CutPaths(match p {
@@ -4786,6 +4856,11 @@ impl Application for App {
 
                         return Task::batch(tasks);
                     }
+                }
+            }
+            Message::TabTreeExpanded(entity, path, items) => {
+                if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
+                    tab.set_tree_children(&path, items);
                 }
             }
             Message::TabView(entity_opt, view) => {
