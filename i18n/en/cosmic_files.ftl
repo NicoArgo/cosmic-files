@@ -381,6 +381,7 @@ show-hidden-files = Show hidden files
 list-directories-first = List directories first
 tree-click-expands = Left click expands folders
 tree-remember = Keep folders expanded
+nav-tree = Expand folders in the sidebar
 gallery-preview = Gallery preview
 menu-settings = Settings...
 menu-about = About COSMIC Files...

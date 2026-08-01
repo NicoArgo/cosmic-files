@@ -586,18 +586,6 @@ pub fn dialog_menu(
                         tab.config.folders_first,
                         Action::ToggleFoldersFirst,
                     ),
-                    menu::Item::CheckBox(
-                        fl!("tree-click-expands"),
-                        None,
-                        tab.config.tree_click_expands,
-                        Action::ToggleTreeClickExpands,
-                    ),
-                    menu::Item::CheckBox(
-                        fl!("tree-remember"),
-                        None,
-                        tab.config.tree_remember,
-                        Action::ToggleTreeRemember,
-                    ),
                     menu::Item::CheckBox(fl!("show-details"), None, show_details, Action::Preview),
                     menu::Item::Divider,
                     menu_button_optional(
@@ -769,6 +757,12 @@ pub fn menu_bar<'a>(
                             None,
                             tab_opt.is_some_and(|tab| tab.config.tree_remember),
                             Action::ToggleTreeRemember,
+                        ),
+                        menu::Item::CheckBox(
+                            fl!("nav-tree"),
+                            None,
+                            config.nav_tree,
+                            Action::ToggleNavTree,
                         ),
                         menu::Item::CheckBox(
                             fl!("show-details"),

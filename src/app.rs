@@ -193,6 +193,7 @@ pub enum Action {
     ToggleFoldersFirst,
     ToggleShowHidden,
     ToggleSort(HeadingOptions),
+    ToggleNavTree,
     ToggleTreeClickExpands,
     ToggleTreeRemember,
     WindowClose,
@@ -276,6 +277,7 @@ impl Action {
             Self::ToggleSort(sort) => {
                 Message::TabMessage(entity_opt, tab::Message::ToggleSort(*sort))
             }
+            Self::ToggleNavTree => Message::ToggleNavTree,
             Self::ToggleTreeClickExpands => Message::ToggleTreeClickExpands,
             Self::ToggleTreeRemember => Message::ToggleTreeRemember,
             Self::WindowClose => Message::WindowClose,
@@ -378,6 +380,8 @@ pub enum Message {
     NavBarClose(Entity),
     NavBarContext(Entity),
     NavMenuAction(NavMenuAction),
+    /// Sub-folders listed for a folder opened in the sidebar.
+    NavExpanded(PathBuf, Vec<PathBuf>),
     NetworkAuth(MounterKey, String, MounterAuth, mpsc::Sender<MounterAuth>),
     NetworkDriveInput(String),
     NetworkDriveOpenEntityAfterMount {
@@ -465,6 +469,7 @@ pub enum Message {
     ToggleContextPage(ContextPage),
     ToggleFoldersFirst,
     ToggleShowHidden,
+    ToggleNavTree,
     ToggleTreeClickExpands,
     ToggleTreeRemember,
     Undo(usize),
@@ -718,12 +723,50 @@ impl Window {
     }
 }
 
+/// Sub-folders of `path`, in the same name order the file list uses. Only
+/// directories: the sidebar lists places to go, not files.
+fn nav_subfolders(path: &Path, show_hidden: bool) -> Vec<PathBuf> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!("failed to read directory {}: {}", path.display(), err);
+            return Vec::new();
+        }
+    };
+    let mut folders: Vec<PathBuf> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !show_hidden && name.starts_with('.') {
+                return None;
+            }
+            // `path().is_dir()` rather than the dirent type, so that symlinked
+            // folders are listed too.
+            let path = entry.path();
+            path.is_dir().then_some(path)
+        })
+        .collect();
+    folders.sort_by(|a, b| {
+        LANGUAGE_SORTER.compare(
+            &a.file_name().unwrap_or_default().to_string_lossy(),
+            &b.file_name().unwrap_or_default().to_string_lossy(),
+        )
+    });
+    folders
+}
+
 // The [`App`] stores application-specific state.
 pub struct App {
     core: Core,
     about: About,
     nav_bar_context_id: segmented_button::Entity,
     nav_model: segmented_button::SingleSelectModel,
+    /// Folders expanded inline in the sidebar, by absolute path. The nav model
+    /// is rebuilt from scratch on every change, so the state has to live here.
+    nav_expanded: BTreeSet<PathBuf>,
+    /// Sub-folders scanned for an expanded sidebar folder.
+    nav_children: FxHashMap<PathBuf, Vec<PathBuf>>,
     tab_model: segmented_button::Model<segmented_button::SingleSelect>,
     config_handler: Option<cosmic_config::Config>,
     state_handler: Option<cosmic_config::Config>,
@@ -1790,8 +1833,80 @@ impl App {
         Task::none()
     }
 
+    /// Insert the opened sub-folders of `parent` below it, one indent level per
+    /// step down. Nothing is inserted for a folder that is closed or whose
+    /// listing has not arrived yet.
+    /// Indentation is set on the built model rather than on the builder, which
+    /// has no `indent`, so the entities are collected as they are inserted.
+    fn insert_nav_children(
+        &self,
+        mut nav_model: segmented_button::ModelBuilder<segmented_button::SingleSelect>,
+        parent: &Path,
+        depth: u16,
+        indents: &mut Vec<(segmented_button::Entity, u16)>,
+    ) -> segmented_button::ModelBuilder<segmented_button::SingleSelect> {
+        if !self.nav_expanded.contains(parent) {
+            return nav_model;
+        }
+        let Some(children) = self.nav_children.get(parent) else {
+            return nav_model;
+        };
+        for child in children {
+            let name = child.file_name().map_or_else(
+                || child.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let path = child.clone();
+            let mut inserted = None;
+            nav_model = nav_model.insert(|b| {
+                b.text(name)
+                    .icon(icon::icon(tab::folder_icon_symbolic(&path, 16)).size(16))
+                    .data(Location::Path(path))
+                    .with_id(|id| inserted = Some(id))
+            });
+            if let Some(id) = inserted {
+                indents.push((id, depth));
+            }
+            nav_model = self.insert_nav_children(nav_model, child, depth + 1, indents);
+        }
+        nav_model
+    }
+
+    /// Open or close `path` in the sidebar, scanning its sub-folders the first
+    /// time it is opened.
+    fn toggle_nav_expand(&mut self, path: PathBuf) -> Task<Message> {
+        if self.nav_expanded.remove(&path) {
+            // Descendants stay in the set so reopening restores the sub-tree.
+            self.update_nav_model();
+            return Task::none();
+        }
+        self.nav_expanded.insert(path.clone());
+        if self.nav_children.contains_key(&path) {
+            self.update_nav_model();
+            return Task::none();
+        }
+        self.scan_nav_children(path)
+    }
+
+    /// List the sub-folders of `path` off the UI thread.
+    fn scan_nav_children(&self, path: PathBuf) -> Task<Message> {
+        let show_hidden = self.config.tab.show_hidden;
+        Task::future(async move {
+            let scan_path = path.clone();
+            match tokio::task::spawn_blocking(move || nav_subfolders(&scan_path, show_hidden)).await
+            {
+                Ok(children) => cosmic::action::app(Message::NavExpanded(path, children)),
+                Err(err) => {
+                    log::warn!("failed to list {}: {}", path.display(), err);
+                    cosmic::action::none()
+                }
+            }
+        })
+    }
+
     fn update_nav_model(&mut self) {
         let mut nav_model = segmented_button::ModelBuilder::default();
+        let mut nav_indents = Vec::new();
 
         if self.config.show_recents {
             nav_model = nav_model.insert(|b| {
@@ -1812,6 +1927,7 @@ impl App {
                 } else {
                     fl!("filesystem")
                 };
+                let child_path = path.clone();
                 nav_model = nav_model.insert(move |b| {
                     b.text(name.clone())
                         .icon(
@@ -1830,6 +1946,12 @@ impl App {
                         })
                         .data(FavoriteIndex(favorite_i))
                 });
+                // Folders opened in the sidebar are listed right below their
+                // favorite, indented; `nav_bar` draws the guide lines itself.
+                if self.config.nav_tree && child_path.is_dir() {
+                    nav_model =
+                        self.insert_nav_children(nav_model, &child_path, 1, &mut nav_indents);
+                }
             }
         }
 
@@ -1892,6 +2014,9 @@ impl App {
         }
 
         self.nav_model = nav_model.build();
+        for (entity, indent) in nav_indents {
+            self.nav_model.indent_set(entity, indent);
+        }
 
         let tab_entity = self.tab_model.active();
         if let Some(tab) = self.tab_model.data::<Tab>(tab_entity) {
@@ -2460,6 +2585,8 @@ impl Application for App {
             about,
             nav_bar_context_id: segmented_button::Entity::null(),
             nav_model: segmented_button::ModelBuilder::default().build(),
+            nav_expanded: BTreeSet::new(),
+            nav_children: FxHashMap::default(),
             tab_model: segmented_button::ModelBuilder::default().build(),
             config_handler: flags.config_handler,
             state_handler: flags.state_handler,
@@ -2791,8 +2918,33 @@ impl Application for App {
             };
 
             if should_open {
+                // A folder also opens inline in the sidebar. Clicking one you
+                // are not in expands it; clicking the one you are already in
+                // closes it — so navigating back up never collapses your tree.
+                let toggle_path = match location {
+                    Location::Path(path) if self.config.nav_tree && path.is_dir() => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                let already_here = toggle_path.as_ref().is_some_and(|path| {
+                    self.tab_model
+                        .data::<Tab>(self.tab_model.active())
+                        .and_then(|tab| tab.location.path_opt())
+                        == Some(path)
+                });
+
                 let message = Message::TabMessage(None, tab::Message::Location(location.clone()));
-                return self.update(message);
+                let nav_task = self.update(message);
+
+                // Run after the tab has moved, so rebuilding the sidebar
+                // highlights the row we just navigated to.
+                return match toggle_path {
+                    Some(path) if already_here || !self.nav_expanded.contains(&path) => {
+                        Task::batch([nav_task, self.toggle_nav_expand(path)])
+                    }
+                    _ => nav_task,
+                };
             }
         }
         if let Some(data) = self.nav_model.data::<MounterData>(entity)
@@ -4496,6 +4648,21 @@ impl Application for App {
                 let mut config = self.config.tab;
                 config.show_hidden = !config.show_hidden;
                 return self.update(Message::TabConfig(config));
+            }
+            Message::NavExpanded(path, children) => {
+                if self.nav_expanded.contains(&path) {
+                    self.nav_children.insert(path, children);
+                    self.update_nav_model();
+                }
+            }
+            Message::ToggleNavTree => {
+                let nav_tree = !self.config.nav_tree;
+                if !nav_tree {
+                    self.nav_expanded.clear();
+                    self.nav_children.clear();
+                }
+                config_set!(nav_tree, nav_tree);
+                return self.update_config();
             }
             Message::ToggleTreeClickExpands => {
                 let mut config = self.config.tab;

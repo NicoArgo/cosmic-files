@@ -167,6 +167,8 @@ pub struct Config {
     pub context_actions: Vec<ContextActionPreset>,
     pub thumb_cfg: ThumbCfg,
     pub favorites: Vec<Favorite>,
+    /// Expand folders inline in the sidebar
+    pub nav_tree: bool,
     pub show_details: bool,
     pub show_recents: bool,
     pub tab: TabConfig,
@@ -233,6 +235,7 @@ impl Default for Config {
                 Favorite::Pictures,
                 Favorite::Videos,
             ],
+            nav_tree: true,
             show_details: false,
             show_recents: true,
             tab: TabConfig::default(),

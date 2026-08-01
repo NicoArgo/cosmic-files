@@ -410,6 +410,7 @@ show-hidden-files = Mostrar arquivos ocultos
 list-directories-first = Listar pastas primeiro
 tree-click-expands = Clique esquerdo expande pastas
 tree-remember = Manter pastas expandidas
+nav-tree = Expandir pastas na barra lateral
 gallery-preview = Pré-visualizar
 menu-settings = Configurações...
 menu-about = Sobre o Gestor de Arquivos...
