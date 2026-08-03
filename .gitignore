@@ -10,3 +10,6 @@
 /test/
 /vendor.tar
 /vendor/
+
+# POP Flow: system-binary backups made by install.sh — never commit these.
+*.orig

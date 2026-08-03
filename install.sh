@@ -18,10 +18,17 @@ fi
 echo "==> Installing to /usr/bin/cosmic-files (needs sudo)..."
 sudo install -m 0755 "$BIN" /usr/bin/cosmic-files
 
-# Keep the auto-reapply golden copy in sync when one is present.
-if [ -f /usr/local/lib/pop-flow/cosmic-files ]; then
+# Keep the auto-reapply golden copy in sync, or say out loud that this install
+# is temporary — silence here used to hide the fact that a package update wipes
+# the feature.
+GOLDEN=/usr/local/lib/pop-flow/cosmic-files
+if [ -f "$GOLDEN" ]; then
     echo "==> Refreshing auto-reapply golden copy"
-    sudo install -m 0755 "$BIN" /usr/local/lib/pop-flow/cosmic-files
+    sudo install -m 0755 "$BIN" "$GOLDEN"
+else
+    echo "!! No auto-reapply hook installed: the next package update of"
+    echo "   cosmic-files will silently restore the stock binary."
+    echo "   Run ./setup-auto-reapply.sh to make this install stick."
 fi
 
 echo "==> Done."
