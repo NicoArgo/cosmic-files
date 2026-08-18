@@ -1875,8 +1875,13 @@ impl App {
     /// Open or close `path` in the sidebar, scanning its sub-folders the first
     /// time it is opened.
     fn toggle_nav_expand(&mut self, path: PathBuf) -> Task<Message> {
-        if self.nav_expanded.remove(&path) {
-            // Descendants stay in the set so reopening restores the sub-tree.
+        if self.nav_expanded.contains(&path) {
+            // What was open inside it closes with it. Nothing about this tree
+            // outlives the click that opened it, so reopening starts clean --
+            // and the cached listing goes too, or a folder created in the
+            // meantime would be missing from a sidebar reopened all day.
+            self.nav_expanded.retain(|open| !open.starts_with(&path));
+            self.nav_children.retain(|scanned, _| !scanned.starts_with(&path));
             self.update_nav_model();
             return Task::none();
         }
@@ -1886,6 +1891,37 @@ impl App {
             return Task::none();
         }
         self.scan_nav_children(path)
+    }
+
+    /// Close every folder opened in the sidebar, dropping the cached listings
+    /// with them. Returns whether anything was open.
+    fn collapse_nav_tree(&mut self) -> bool {
+        if self.nav_expanded.is_empty() {
+            return false;
+        }
+        self.nav_expanded.clear();
+        self.nav_children.clear();
+        self.update_nav_model();
+        true
+    }
+
+    /// Close the sidebar tree unless the active tab is still somewhere inside
+    /// it. The tree belongs to where you are: leave that folder by any route --
+    /// the sidebar, the path bar, the back button, a double click in the list
+    /// -- and it goes away instead of piling up behind you.
+    fn collapse_nav_tree_unless_inside(&mut self) {
+        let inside = self
+            .tab_model
+            .data::<Tab>(self.tab_model.active())
+            .and_then(|tab| tab.location.path_opt())
+            .is_some_and(|path| {
+                self.nav_expanded
+                    .iter()
+                    .any(|open| path.starts_with(open))
+            });
+        if !inside {
+            self.collapse_nav_tree();
+        }
     }
 
     /// List the sub-folders of `path` off the UI thread.
@@ -2920,7 +2956,9 @@ impl Application for App {
             if should_open {
                 // A folder also opens inline in the sidebar. Clicking one you
                 // are not in expands it; clicking the one you are already in
-                // closes it — so navigating back up never collapses your tree.
+                // closes it. Only one branch is ever open, because moving the
+                // tab out of it closes it — see collapse_nav_tree_unless_inside,
+                // which runs on the navigation this is about to trigger.
                 let toggle_path = match location {
                     Location::Path(path) if self.config.nav_tree && path.is_dir() => {
                         Some(path.clone())
@@ -3742,6 +3780,9 @@ impl Application for App {
             Message::Mouse(window_id, _button) => {
                 // Close context menu when clicking outside.
                 if self.core.main_window_id() == Some(window_id) {
+                    // And the sidebar tree with it: this fires for a press no
+                    // widget claimed, which is a click outside anything.
+                    self.collapse_nav_tree();
                     return self.close_context_menus();
                 }
             }
@@ -4556,6 +4597,7 @@ impl Application for App {
 
                 // Activate new tab
                 self.tab_model.activate(entity);
+                self.collapse_nav_tree_unless_inside();
                 if let Some(tab) = self.tab_model.data::<Tab>(entity) {
                     {
                         //Restore scroll
@@ -4677,10 +4719,31 @@ impl Application for App {
             Message::TabMessage(entity_opt, tab_message) => {
                 let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
 
+                // A click in the file list is a click outside the sidebar, and
+                // the sidebar tree is a dropdown rather than a second pane: it
+                // closes. Two deliberate absences: Location, which is the
+                // message the sidebar itself sends to navigate, and Click --
+                // the release is what makes it a click, and waiting for it
+                // leaves dragging a file from the list into an open sub-folder
+                // working, since that press never gets a release over the list.
+                if matches!(
+                    tab_message,
+                    tab::Message::ClickRelease(..)
+                        | tab::Message::DoubleClick(..)
+                        | tab::Message::RightClick(..)
+                        | tab::Message::MiddleClick(..)
+                        | tab::Message::ToggleExpand(..)
+                ) {
+                    self.collapse_nav_tree();
+                }
+
                 let tab_commands = match self.tab_model.data_mut::<Tab>(entity) {
                     Some(tab) => tab.update(tab_message, self.modifiers),
                     _ => Vec::new(),
                 };
+
+                // After tab.update, so the tab has already moved.
+                self.collapse_nav_tree_unless_inside();
 
                 let mut commands = Vec::new();
                 for tab_command in tab_commands {
