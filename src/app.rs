@@ -466,6 +466,7 @@ pub enum Message {
     TabTreeExpanded(Entity, PathBuf, Vec<tab::Item>),
     TabView(Option<Entity>, tab::View),
     TimeConfigChange(TimeConfig),
+    FolderRules(crate::folder_color::TermRules),
     ToggleContextPage(ContextPage),
     ToggleFoldersFirst,
     ToggleShowHidden,
@@ -1860,7 +1861,10 @@ impl App {
             let mut inserted = None;
             nav_model = nav_model.insert(|b| {
                 b.text(name)
-                    .icon(icon::icon(tab::folder_icon_symbolic(&path, 16)).size(16))
+                    .icon(crate::folder_color::tint_symbolic(
+                        icon::icon(tab::folder_icon_symbolic(&path, 16)).size(16),
+                        &path,
+                    ))
                     .data(Location::Path(path))
                     .with_id(|id| inserted = Some(id))
             });
@@ -1966,14 +1970,15 @@ impl App {
                 let child_path = path.clone();
                 nav_model = nav_model.insert(move |b| {
                     b.text(name.clone())
-                        .icon(
-                            icon::icon(if path.is_dir() {
-                                tab::folder_icon_symbolic(&path, 16)
-                            } else {
-                                icon::from_name("text-x-generic-symbolic").size(16).handle()
-                            })
-                            .size(16),
-                        )
+                        .icon(if path.is_dir() {
+                            crate::folder_color::tint_symbolic(
+                                icon::icon(tab::folder_icon_symbolic(&path, 16)).size(16),
+                                &path,
+                            )
+                        } else {
+                            icon::icon(icon::from_name("text-x-generic-symbolic").size(16).handle())
+                                .size(16)
+                        })
                         .data(match favorite {
                             Favorite::Network { uri, name, path } => {
                                 Location::Network(uri.clone(), name.clone(), Some(path.to_owned()))
@@ -5111,6 +5116,17 @@ impl Application for App {
                     tab.refresh_cut(&paths);
                 }
             }
+            Message::FolderRules(rules) => {
+                if crate::folder_color::set_rules(&rules) {
+                    let entities: Box<[_]> = self.tab_model.iter().collect();
+                    for entity in entities {
+                        if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
+                            tab.refresh_folder_icons();
+                        }
+                    }
+                    self.update_nav_model();
+                }
+            }
             Message::TimeConfigChange(time_config) => {
                 self.config.tab.military_time = time_config.military_time;
                 return self.update_config();
@@ -6991,6 +7007,7 @@ impl Application for App {
         struct WatcherSubscription;
         struct TrashWatcherSubscription;
         struct TimeSubscription;
+        struct FolderRulesSubscription;
         #[cfg(all(
             not(feature = "desktop-applet"),
             not(target_os = "ios"),
@@ -7069,6 +7086,13 @@ impl Application for App {
                 }
                 Message::TimeConfigChange(update.config)
             }),
+            // Folder colors live in the terminal's rules; follow them live.
+            cosmic_config::config_subscription::<_, crate::folder_color::TermRules>(
+                TypeId::of::<FolderRulesSubscription>(),
+                crate::folder_color::TERM_CONFIG_ID.into(),
+                crate::folder_color::TERM_CONFIG_VERSION,
+            )
+            .map(|update| Message::FolderRules(update.config)),
             Subscription::run_with(TypeId::of::<WatcherSubscription>(), |_| {
                 stream::channel(
                     100,

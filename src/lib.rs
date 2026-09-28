@@ -18,6 +18,7 @@ pub mod channel;
 pub mod clipboard;
 pub mod config;
 mod context_action;
+pub mod folder_color;
 pub mod dialog;
 mod key_bind;
 pub(crate) mod large_image;
