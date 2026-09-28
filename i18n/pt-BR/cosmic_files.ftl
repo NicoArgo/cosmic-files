@@ -437,6 +437,7 @@ copy-to = Copiar para...
 move-to = Mover para...
 keywords = Pasta;Gerenciador;
 show-recents = Pasta de recentes na barra lateral
+default-grid-view = Abrir pastas em grade por padrão
 clear-recents-history = Limpar histórico de recentes
 copy-path = Copiar caminho
 mixed = Misto

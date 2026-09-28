@@ -113,6 +113,8 @@ pub enum TypeToSearch {
 #[serde(default)]
 pub struct State {
     pub sort_names: FxOrderMap<String, (HeadingOptions, bool)>,
+    /// Folders shown in a view other than the default one
+    pub view_names: FxOrderMap<String, View>,
 }
 
 impl Default for State {
@@ -124,6 +126,7 @@ impl Default for State {
                     (HeadingOptions::Modified, false),
                 )
             })),
+            view_names: FxOrderMap::default(),
         }
     }
 }

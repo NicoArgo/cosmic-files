@@ -311,6 +311,7 @@ error = Error
 settings = Settings
 single-click = Single click to open
 show-recents = Recents folder in the sidebar
+default-grid-view = Open folders in grid view by default
 
 ### Appearance
 appearance = Appearance

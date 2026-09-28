@@ -439,12 +439,14 @@ pub enum Message {
     ReplaceResult(ReplaceResult),
     RestoreFromTrash(Option<Entity>),
     SaveSortNames,
+    SaveViewNames,
     ScrollTab(i16),
     SearchActivate,
     SearchClear,
     SearchInput(String),
     SetShowDetails(bool),
     SetShowRecents(bool),
+    SetDefaultView(tab::View),
     SetTypeToSearch(TypeToSearch),
     SystemThemeModeChange,
     Size(window::Id, Size),
@@ -784,6 +786,7 @@ pub struct App {
     modifiers: Modifiers,
     mounter_items: FxHashMap<MounterKey, MounterItems>,
     must_save_sort_names: bool,
+    must_save_view_names: bool,
     network_drive_connecting: Option<(MounterKey, String)>,
     network_drive_input: String,
     #[cfg(feature = "notify")]
@@ -1778,6 +1781,61 @@ impl App {
         Task::batch(commands)
     }
 
+    /// Key under which a location remembers its grid/list view. Searches keep
+    /// whatever view they started in, and the desktop is always a grid.
+    fn view_key(location: &Location) -> Option<String> {
+        match location {
+            Location::Desktop(..) | Location::Search(..) => None,
+            // Rebuilding from components drops a trailing slash, so the same
+            // folder reached from the sidebar or the breadcrumb shares a key.
+            Location::Path(path) => {
+                Some(path.components().collect::<PathBuf>().display().to_string())
+            }
+            _ => Some(location.normalize().to_string()),
+        }
+    }
+
+    /// The view a location opens in: its own choice, else the default view.
+    fn view_for(&self, location: &Location) -> Option<tab::View> {
+        let key = Self::view_key(location)?;
+        Some(
+            self.state
+                .view_names
+                .get(&key)
+                .copied()
+                .unwrap_or(self.config.tab.view),
+        )
+    }
+
+    /// Show every app tab in the view its location remembers.
+    fn apply_views(&mut self) {
+        let entities: Box<[_]> = self.tab_model.iter().collect();
+        for entity in entities {
+            let Some(view) = self
+                .tab_model
+                .data::<Tab>(entity)
+                .filter(|tab| !matches!(tab.mode, tab::Mode::Desktop))
+                .and_then(|tab| self.view_for(&tab.location))
+            else {
+                continue;
+            };
+            if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
+                tab.config.view = view;
+            }
+        }
+    }
+
+    fn schedule_save_view_names(&mut self) -> Task<Message> {
+        if self.must_save_view_names {
+            return Task::none();
+        }
+        self.must_save_view_names = true;
+        cosmic::Task::future(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cosmic::action::app(Message::SaveViewNames)
+        })
+    }
+
     fn update_desktop(&mut self) -> Task<Message> {
         let needs_reload: Box<[_]> = (self.tab_model.iter())
             .filter_map(|entity| {
@@ -2479,6 +2537,18 @@ impl App {
                     )
                 })
                 .add({
+                    settings::item::builder(fl!("default-grid-view")).toggler(
+                        tab_config.view == tab::View::Grid,
+                        |grid| {
+                            Message::SetDefaultView(if grid {
+                                tab::View::Grid
+                            } else {
+                                tab::View::List
+                            })
+                        },
+                    )
+                })
+                .add({
                     settings::item::builder(fl!("show-recents"))
                         .toggler(self.config.show_recents, Message::SetShowRecents)
                 })
@@ -2640,6 +2710,7 @@ impl Application for App {
             modifiers: Modifiers::empty(),
             mounter_items: FxHashMap::default(),
             must_save_sort_names: false,
+            must_save_view_names: false,
             network_drive_connecting: None,
             network_drive_input: String::new(),
             #[cfg(feature = "notify")]
@@ -4585,6 +4656,19 @@ impl Application for App {
                 config_set!(show_recents, show_recents);
                 return self.update_config();
             }
+            Message::SetDefaultView(view) => {
+                let mut config = self.config.tab;
+                config.view = view;
+                let task = self.update(Message::TabConfig(config));
+                // A folder that picked the new default no longer departs from it.
+                let before = self.state.view_names.len();
+                self.state.view_names.retain(|_, v| *v != view);
+                self.apply_views();
+                if self.state.view_names.len() != before {
+                    return task.chain(self.schedule_save_view_names());
+                }
+                return task;
+            }
             Message::SetTypeToSearch(type_to_search) => {
                 config_set!(type_to_search, type_to_search);
                 return self.update_config();
@@ -5040,9 +5124,15 @@ impl Application for App {
             Message::TabRescan(entity, mut location, parent_item_opt, items, selection_paths) => {
                 location = location.normalize();
                 let icon_sizes = self.config.tab.icon_sizes;
+                let view_opt = self.view_for(&location);
                 if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
                     tab.location = tab.location.normalize();
                     if location == tab.location {
+                        if let Some(view) = view_opt
+                            && !matches!(tab.mode, tab::Mode::Desktop)
+                        {
+                            tab.config.view = view;
+                        }
                         tab.parent_item_opt = parent_item_opt;
                         tab.set_items(items);
                         let location_str = location.to_string();
@@ -5095,16 +5185,46 @@ impl Application for App {
             }
             Message::TabView(entity_opt, view) => {
                 let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
-                if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
-                    if matches!(tab.mode, tab::Mode::Desktop) {
-                        return Task::none();
-                    }
-
-                    tab.config.view = view;
+                let Some(tab) = self.tab_model.data_mut::<Tab>(entity) else {
+                    return Task::none();
+                };
+                if matches!(tab.mode, tab::Mode::Desktop) {
+                    return Task::none();
                 }
-                let mut config = self.config.tab;
-                config.view = view;
-                return self.update(Message::TabConfig(config));
+                tab.config.view = view;
+
+                // The choice belongs to this folder, not to every folder: remember
+                // it only when it departs from the default, and show it in every
+                // tab open on the same folder.
+                let Some(key) = Self::view_key(&tab.location) else {
+                    return Task::none();
+                };
+                // Reinserting moves the folder to the newest end, so truncation
+                // below drops the least recently changed folders.
+                self.state.view_names.remove(&key);
+                if view != self.config.tab.view {
+                    self.state.view_names.insert(key.clone(), view);
+                    const MAX_VIEW_NAMES: usize = 999;
+                    if self.state.view_names.len() > MAX_VIEW_NAMES {
+                        self.state.view_names = self
+                            .state
+                            .view_names
+                            .split_off(self.state.view_names.len() - MAX_VIEW_NAMES);
+                    }
+                }
+                self.apply_views();
+
+                // A rescan while in the grid leaves out the rows of expanded
+                // folders, so going back to the list scans them again.
+                let icon_sizes = self.config.tab.icon_sizes;
+                let entities: Box<[_]> = self.tab_model.iter().collect();
+                let scans = entities.into_iter().filter_map(|entity| {
+                    let tab = self.tab_model.data::<Tab>(entity)?;
+                    (Self::view_key(&tab.location).as_ref() == Some(&key))
+                        .then(|| Self::scan_tree_folders(entity, tab.tree_scan_paths(), icon_sizes))
+                });
+                let scans = Task::batch(scans.collect::<Vec<_>>());
+                return Task::batch([scans, self.schedule_save_view_names()]);
             }
             Message::CutPaths(paths) => {
                 if let Some(tab) = self.tab_model.active_data_mut::<Tab>() {
@@ -5774,6 +5894,15 @@ impl Application for App {
                         )
                 {
                     log::warn!("Failed to save sort names: {err:?}");
+                }
+            }
+            Message::SaveViewNames => {
+                self.must_save_view_names = false;
+                if let Some(state_handler) = self.state_handler.as_ref()
+                    && let Err(err) = state_handler
+                        .set::<&FxOrderMap<String, tab::View>>("view_names", &self.state.view_names)
+                {
+                    log::warn!("Failed to save view names: {err:?}");
                 }
             }
             Message::NetworkDriveOpenEntityAfterMount { entity } => {
@@ -6780,7 +6909,47 @@ impl Application for App {
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        let mut elements = Vec::with_capacity(2);
+        let mut elements = Vec::with_capacity(3);
+
+        // One button per view, the current one highlighted: switching is a
+        // single click, and the choice is remembered for this folder.
+        if let Some(tab) = self.tab_model.active_data::<Tab>()
+            && matches!(tab.mode, tab::Mode::App)
+            && !matches!(tab.location, Location::Desktop(..))
+        {
+            let view_button = |view: tab::View, icon_name, label: String, action: Action| {
+                widget::tooltip(
+                    widget::button::icon(icon::from_name(icon_name))
+                        .on_press(action.message(None))
+                        .padding(8)
+                        // Plain icon buttons ignore `selected`; this class
+                        // paints it, so the current view stands out.
+                        .class(cosmic::theme::Button::IconVertical)
+                        .selected(tab.config.view == view),
+                    widget::text::body(match self.key_binds.iter().find(|(_, a)| **a == action) {
+                        Some((key_bind, _)) => format!("{label} ({key_bind})"),
+                        None => label,
+                    }),
+                    widget::tooltip::Position::Bottom,
+                )
+            };
+            elements.push(
+                widget::row::with_capacity(2)
+                    .push(view_button(
+                        tab::View::List,
+                        "view-list-symbolic",
+                        fl!("list-view"),
+                        Action::TabViewList,
+                    ))
+                    .push(view_button(
+                        tab::View::Grid,
+                        "view-grid-symbolic",
+                        fl!("grid-view"),
+                        Action::TabViewGrid,
+                    ))
+                    .into(),
+            );
+        }
 
         if let Some(term) = self.search_get() {
             if self.core.is_condensed() {
