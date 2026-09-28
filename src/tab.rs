@@ -280,7 +280,11 @@ fn button_style(
 }
 
 pub fn folder_icon(path: &PathBuf, icon_size: u16) -> widget::icon::Handle {
-    widget::icon::from_name(SPECIAL_DIRS.get(path).map_or("folder", |x| *x))
+    let name = SPECIAL_DIRS.get(path).map_or("folder", |x| *x);
+    if let Some(color) = crate::folder_color::color_for(path) {
+        return crate::folder_color::colored_icon(name, icon_size, color);
+    }
+    widget::icon::from_name(name)
         .prefer_svg(true)
         .size(icon_size)
         .handle()
@@ -3043,6 +3047,23 @@ impl Tab {
 
     pub const fn items_opt_mut(&mut self) -> Option<&mut Vec<Item>> {
         self.items_opt.as_mut()
+    }
+
+    /// Redraw folder icons after the folder colors changed, without a rescan.
+    /// Trashed folders keep the icon they were listed with.
+    pub fn refresh_folder_icons(&mut self) {
+        let sizes = self.config.icon_sizes;
+        for item in self.items_opt.iter_mut().flatten() {
+            if matches!(item.metadata, ItemMetadata::Trash { .. }) || !item.metadata.is_dir() {
+                continue;
+            }
+            let Some(path) = item.path_opt().cloned() else {
+                continue;
+            };
+            item.icon_handle_grid = folder_icon(&path, sizes.grid());
+            item.icon_handle_list = folder_icon(&path, sizes.list());
+            item.icon_handle_list_condensed = folder_icon(&path, sizes.list_condensed());
+        }
     }
 
     pub fn set_items(&mut self, mut items: Vec<Item>) {

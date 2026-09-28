@@ -143,6 +143,7 @@ xdgen = "0.1"
 # cap-std = "3"
 # cap-tempfile = "3"
 fastrand = "2"
+ron = "0.11"
 test-log = "0.2"
 tokio = { version = "1", features = ["rt", "macros"] }
 
