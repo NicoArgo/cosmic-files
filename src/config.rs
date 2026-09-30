@@ -255,10 +255,10 @@ pub struct DesktopConfig {
     pub show_content: bool,
     pub show_mounted_drives: bool,
     pub show_trash: bool,
-    /// POP Flow: icons stay in this many columns at the left, each filled top
-    /// to bottom; when they no longer fit the screen, the columns grow below it
-    /// and the desktop scrolls. 0 keeps upstream's layout (fill the whole
-    /// width, then page down).
+    /// POP Flow: icons nobody has placed yet (new files, or all of them before
+    /// the first drag) fill this many columns at the left, down each column; a
+    /// full screen continues below it and the desktop scrolls. Icons dragged by
+    /// the user go anywhere on the grid (see `desktop_layout`). 0 = all columns.
     pub columns: u16,
 }
 

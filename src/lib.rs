@@ -17,6 +17,7 @@ mod archive;
 pub mod channel;
 pub mod clipboard;
 pub mod config;
+pub mod desktop_layout;
 mod context_action;
 pub mod folder_color;
 pub mod dialog;

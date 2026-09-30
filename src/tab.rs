@@ -30,7 +30,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
@@ -54,6 +54,7 @@ use crate::config::{
     ContextActionPreset, DesktopConfig, ICON_SCALE_MAX, ICON_SIZE_GRID, IconSizes, TabConfig,
     ThumbCfg,
 };
+use crate::desktop_layout;
 use crate::dialog::DialogKind;
 use crate::large_image::{
     LargeImageManager, decode_large_image, exceeds_memory_limit, should_use_dedicated_worker,
@@ -1829,6 +1830,8 @@ pub enum Message {
     DndHover(Location),
     DndEnter(Location),
     DndLeave(Location),
+    /// POP Flow: pointer position of a drag over this tab (surface coords).
+    DndMotion(f64, f64),
     WindowDrag,
     WindowToggleMaximize,
     ZoomIn,
@@ -2885,6 +2888,13 @@ pub struct Tab {
     watch_drag: bool,
     window_id: Option<window::Id>,
     large_image_manager: LargeImageManager,
+    /// POP Flow: saved desktop icon cells, loaded on first draw of a desktop.
+    desktop_cells: RefCell<Option<HashMap<String, desktop_layout::Cell>>>,
+    /// POP Flow: desktop grid geometry as last drawn, to turn a drop point
+    /// into a cell.
+    desktop_geometry: Cell<Option<desktop_layout::Geometry>>,
+    /// POP Flow: last pointer position of a drag over this tab.
+    dnd_point: Option<Point>,
 }
 
 async fn calculate_dir_size(path: &Path, controller: Controller) -> Result<u64, OperationError> {
@@ -3033,6 +3043,9 @@ impl Tab {
             watch_drag: true,
             window_id,
             large_image_manager: LargeImageManager::new(),
+            desktop_cells: RefCell::new(None),
+            desktop_geometry: Cell::new(None),
+            dnd_point: None,
         }
     }
 
@@ -4986,6 +4999,17 @@ impl Tab {
             }
             Message::Drop(Some((to, mut from))) => {
                 self.dnd_hovered = None;
+                // POP Flow: desktop icons dropped back on the desktop are being
+                // arranged, not copied — move them to the cell under the drop.
+                if let Location::Desktop(dir, output, _) = &to
+                    && matches!(self.mode, Mode::Desktop)
+                    && !from.paths.is_empty()
+                    && from.paths.iter().all(|p| p.parent() == Some(dir.as_path()))
+                {
+                    let output = output.clone();
+                    self.desktop_move(&from.paths, &output);
+                    return commands;
+                }
                 match to {
                     Location::Desktop(to, ..)
                     | Location::Path(to)
@@ -5032,6 +5056,32 @@ impl Tab {
                         })
                         .into(),
                     ));
+                }
+            }
+            Message::DndMotion(x, y) => {
+                if matches!(self.mode, Mode::Desktop) {
+                    let (x, y) = (x as f32, y as f32);
+                    self.dnd_point = Some(Point::new(x, y));
+                    // Near the top or bottom edge, scroll: dragging an icon to
+                    // the bottom reveals the empty row kept below the last one,
+                    // and keeps going for as long as the pointer moves there.
+                    const EDGE: f32 = 56.0;
+                    const STEP: f32 = 36.0;
+                    let scrolled = self.scroll_opt.is_some_and(|o| o.y > 0.0);
+                    let dy = match self.size_opt.get() {
+                        Some(size) if y > size.height - EDGE => STEP,
+                        Some(_) if y < EDGE && scrolled => -STEP,
+                        _ => 0.0,
+                    };
+                    if dy != 0.0 {
+                        commands.push(Command::Iced(
+                            scrollable::scroll_by(
+                                self.scrollable_id.clone(),
+                                AbsoluteOffset { x: 0.0, y: dy },
+                            )
+                            .into(),
+                        ));
+                    }
                 }
             }
             Message::DndLeave(loc) => {
@@ -5959,6 +6009,78 @@ impl Tab {
         .into()
     }
 
+    /// POP Flow: moves the dragged desktop icons (`paths`) to where their
+    /// drag image was dropped, snapped to the grid, and saves the layout.
+    ///
+    /// The drag image puts the top-left cell of the dragged group just under
+    /// the pointer (see the drag icon offset in `view`), so the group's
+    /// top-left icon goes to the cell nearest that image cell, and the rest of
+    /// the group follows at the same offsets.
+    fn desktop_move(&mut self, paths: &[PathBuf], output: &str) {
+        let (Some(point), Some(geometry)) = (self.dnd_point.take(), self.desktop_geometry.get())
+        else {
+            return;
+        };
+        let Some(items) = self.items_opt.as_ref() else {
+            return;
+        };
+        let cosmic_theme::Spacing {
+            space_xxs,
+            space_xxxs,
+            ..
+        } = theme::spacing();
+
+        let all: HashMap<String, desktop_layout::Cell> = items
+            .iter()
+            .filter_map(|item| Some((item.name.clone(), item.pos_opt.get()?)))
+            .collect();
+        let moving: Vec<(String, desktop_layout::Cell)> = items
+            .iter()
+            .filter(|item| item.path_opt().is_some_and(|p| paths.contains(p)))
+            .filter_map(|item| Some((item.name.clone(), item.pos_opt.get()?)))
+            .collect();
+        let (Some(top), Some(left)) = (
+            moving.iter().map(|(_, c)| c.0).min(),
+            moving.iter().map(|(_, c)| c.1).min(),
+        ) else {
+            return;
+        };
+
+        // Same offset the drag icon is given in `view`.
+        let offset_x = f32::from(space_xxs).mul_add(-3.0, -f32::from(space_xxxs));
+        let offset_y = -4.0 * f32::from(space_xxxs);
+        let scroll_y = self.scroll_opt.map_or(0.0, |o| o.y);
+        let image_x = point.x + offset_x + geometry.padding;
+        let image_y = point.y + offset_y + geometry.padding + scroll_y;
+        let target = geometry.cell_at(
+            image_x + geometry.item_width / 2.0,
+            image_y + geometry.item_height / 2.0,
+        );
+        if target == (top, left) {
+            return;
+        }
+
+        let moved = desktop_layout::move_group(&all, &moving, (top, left), target, geometry.cols);
+
+        // Everything on screen is frozen where it is, so a new file appearing
+        // later takes a free cell instead of reshuffling the icons. Saved cells
+        // of files that still exist but aren't shown (hidden files) are kept.
+        let mut cache = self.desktop_cells.borrow_mut();
+        let names: FxHashSet<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        let mut cells: HashMap<String, desktop_layout::Cell> = cache
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, _)| names.contains(name.as_str()))
+            .collect();
+        cells.extend(all);
+        cells.extend(moved);
+        if let Err(err) = desktop_layout::save(output, &cells) {
+            log::warn!("failed to save desktop icon positions: {err}");
+        }
+        *cache = Some(cells);
+    }
+
     pub fn grid_view(
         &self,
     ) -> (
@@ -6047,14 +6169,36 @@ impl Tab {
 
         let mut column = widget::column::with_capacity(2);
         if let Some(items) = self.column_sort() {
-            // POP Flow: fixed desktop columns need the total up front, since it
-            // decides how long each column grows once the screen is full.
-            let desktop_total = items
-                .iter()
-                .filter(|(_, item)| item.tree_parent.is_none() && (show_hidden || !item.hidden))
-                .count();
-            let desktop_fixed_columns = (matches!(self.mode, Mode::Desktop) && desktop_columns > 0)
-                .then(|| desktop_columns.min(cols));
+            // POP Flow: on the desktop every icon owns a cell — the one the user
+            // dropped it in, or the first free one in the classic order.
+            let desktop_cells: Option<HashMap<usize, desktop_layout::Cell>> =
+                if let Location::Desktop(_, output, _) = &self.location
+                    && matches!(self.mode, Mode::Desktop)
+                {
+                    let mut cache = self.desktop_cells.borrow_mut();
+                    let saved = cache.get_or_insert_with(|| desktop_layout::load(output));
+                    let shown: Vec<(usize, &str)> = items
+                        .iter()
+                        .filter(|(_, item)| {
+                            item.tree_parent.is_none() && (show_hidden || !item.hidden)
+                        })
+                        .map(|(i, item)| (*i, item.name.as_str()))
+                        .collect();
+                    let names: Vec<&str> = shown.iter().map(|(_, n)| *n).collect();
+                    let cells =
+                        desktop_layout::assign(&names, saved, cols, rows, desktop_columns);
+                    self.desktop_geometry.set(Some(desktop_layout::Geometry {
+                        padding: space_xxs as f32,
+                        item_width: item_width as f32,
+                        item_height: item_height as f32,
+                        column_step: (item_width + column_spacing as usize) as f32,
+                        row_step: (item_height + grid_spacing as usize) as f32,
+                        cols,
+                    }));
+                    Some(shown.iter().map(|(i, _)| *i).zip(cells).collect())
+                } else {
+                    None
+                };
             let mut count = 0;
             let mut col = 0;
             let mut row = 0;
@@ -6075,6 +6219,9 @@ impl Tab {
                     item.rect_opt.set(None);
                     hidden += 1;
                     continue;
+                }
+                if let Some(cell) = desktop_cells.as_ref().and_then(|c| c.get(&i)) {
+                    (row, col) = *cell;
                 }
                 item.pos_opt.set(Some((row, col)));
                 let item_rect = Rectangle::new(
@@ -6174,21 +6321,21 @@ impl Tab {
                         .on_middle_press(move |_| Message::MiddleClick(i))
                         .on_enter(move || Message::HighlightActivate(i))
                         .on_exit(move || Message::HighlightDeactivate(i));
-                    grid_elements[row].push(Element::from(mouse_area));
+                    grid_elements[row].push((col, Element::from(mouse_area)));
                 } else {
                     // Add a spacer if the row is empty, so scroll works
                     if grid_elements[row].is_empty() {
-                        grid_elements[row].push(Element::from(
+                        grid_elements[row].push((col, Element::from(
                             widget::column::with_capacity(0)
                                 .width(Length::Fill)
                                 .height(Length::Fixed(item_height as f32)),
-                        ));
+                        )));
                     }
                 }
 
                 count += 1;
-                if let Some(columns) = desktop_fixed_columns {
-                    (row, col) = desktop_column_position(count, desktop_total, rows, columns);
+                if desktop_cells.is_some() {
+                    // Placed from the cell map at the top of the next pass.
                 } else if matches!(self.mode, Mode::Desktop) {
                     row += 1;
                     if row >= page_row + rows {
@@ -6209,9 +6356,31 @@ impl Tab {
                 }
             }
 
-            for row_elements in grid_elements {
-                for element in row_elements {
+            let cell_spacer = || {
+                Element::from(
+                    widget::column::with_capacity(0)
+                        .width(Length::Fixed(item_width as f32))
+                        .height(Length::Fixed(item_height as f32)),
+                )
+            };
+            for mut row_elements in grid_elements {
+                // POP Flow: desktop cells can leave gaps — empty columns within
+                // a row, whole empty rows between icons. Both get a cell-sized
+                // spacer, or the grid would close the gap and shift icons.
+                if row_elements.is_empty() {
+                    row_elements.push((0, cell_spacer()));
+                }
+                row_elements.sort_by_key(|(c, _)| *c);
+                let mut next_col = 0;
+                for (c, element) in row_elements {
+                    if desktop_cells.is_some() {
+                        while next_col < c {
+                            grid = grid.push(cell_spacer());
+                            next_col += 1;
+                        }
+                    }
                     grid = grid.push(element);
+                    next_col = c + 1;
                 }
                 grid = grid.insert_row();
             }
@@ -6245,6 +6414,16 @@ impl Tab {
                         height: s.height - top_deduct as f32,
                     }));
 
+                // POP Flow: while something is dragged over the desktop there is
+                // always one empty row below the last icon, so the view can
+                // scroll to it and the icon can be dropped there.
+                if desktop_cells.is_some() && self.dnd_hovered.is_some() {
+                    column = column.push(widget::container(
+                        space::vertical()
+                            .height(Length::Fixed((item_height + grid_spacing as usize) as f32)),
+                    ));
+                }
+
                 let spacer_height = height.saturating_sub(max_bottom + top_deduct);
                 if spacer_height > 0 {
                     column = column.push(widget::container(
@@ -6254,6 +6433,8 @@ impl Tab {
             }
         }
 
+        // The drag image walks the selection row by row, column by column.
+        dnd_items.sort_by_key(|(_, cell, _)| *cell);
         let drag_list = (!dnd_items.is_empty()).then(|| {
             let mut dnd_grid = widget::grid()
                 .column_spacing(column_spacing)
@@ -7021,6 +7202,7 @@ impl Tab {
             }
         })
         .on_enter(move |_, _, _| Message::DndEnter(tab_location_2.clone()))
+        .on_motion(Message::DndMotion)
         .on_leave(move || Message::DndLeave(tab_location_3.clone()));
 
         dnd_dest.into()
@@ -7730,22 +7912,6 @@ impl Tab {
     }
 }
 
-/// POP Flow: where the `index`-th desktop icon goes when the desktop keeps its
-/// icons in `columns` columns at the left. Each column fills top to bottom; while
-/// everything fits, a column holds as many icons as fit the screen (`rows_fit`),
-/// exactly like upstream. Past that, the columns grow evenly below the screen
-/// and the desktop scrolls instead of spreading icons over the wallpaper.
-pub(crate) fn desktop_column_position(
-    index: usize,
-    total: usize,
-    rows_fit: usize,
-    columns: usize,
-) -> (usize, usize) {
-    let columns = columns.max(1);
-    let rows = rows_fit.max(total.div_ceil(columns)).max(1);
-    (index % rows, index / rows)
-}
-
 pub fn respond_to_scroll_direction(delta: ScrollDelta, modifiers: &Modifiers) -> Option<Message> {
     if !modifiers.control() {
         return None;
@@ -7829,7 +7995,7 @@ mod tests {
 
     use super::{
         Command, HeadingOptions, ItemMetadata, ItemThumbnail, Location, Message, Tab, View,
-        desktop_column_position, respond_to_scroll_direction, scan_path,
+        respond_to_scroll_direction, scan_path,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -7918,34 +8084,6 @@ mod tests {
         Ok((fs, tab, dirs))
     }
 
-
-    #[test]
-    fn desktop_columns_fill_like_upstream_while_they_fit() {
-        // 31 icons, 9 fit a column, 4 columns: 9 + 9 + 9 + 4, as today.
-        let at = |i| desktop_column_position(i, 31, 9, 4);
-        assert_eq!(at(0), (0, 0));
-        assert_eq!(at(8), (8, 0));
-        assert_eq!(at(9), (0, 1));
-        assert_eq!(at(30), (3, 3));
-    }
-
-    #[test]
-    fn desktop_columns_grow_below_the_screen_instead_of_widening() {
-        // 50 icons, 9 fit, 4 columns: 13 per column, never a 5th column.
-        for i in 0..50 {
-            let (row, col) = desktop_column_position(i, 50, 9, 4);
-            assert!(col < 4, "icon {i} spilled into column {col}");
-            assert!(row < 13);
-        }
-        assert_eq!(desktop_column_position(13, 50, 9, 4), (0, 1));
-        assert_eq!(desktop_column_position(49, 50, 9, 4), (10, 3));
-    }
-
-    #[test]
-    fn desktop_columns_survive_degenerate_input() {
-        assert_eq!(desktop_column_position(0, 0, 0, 0), (0, 0));
-        assert_eq!(desktop_column_position(3, 5, 0, 1), (3, 0));
-    }
 
     #[test]
     fn scan_path_succeeds_on_valid_path() -> io::Result<()> {
