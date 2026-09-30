@@ -191,15 +191,17 @@ fn button_appearance(
             appearance.background = Some(Color::from(cosmic.bg_component_color()).into());
         }
     } else if desktop {
-        appearance.background = Some(Color::from(cosmic.bg_color()).into());
-        appearance.icon_color = Some(Color::from(cosmic.on_bg_color()));
-        if cut {
-            appearance.text_color = Some(Color::from(
-                cosmic.background(theme.transparent).component.disabled,
-            ));
+        // POP Flow: no block behind the name at rest — it cluttered the
+        // wallpaper. White text over a drawn shadow (see
+        // `desktop_or_grid_name`) stays legible on light and dark wallpapers
+        // alike; the block comes back on hover and selection above.
+        appearance.background = None;
+        appearance.icon_color = Some(Color::WHITE);
+        appearance.text_color = Some(if cut {
+            Color::from_rgba(1.0, 1.0, 1.0, 0.55)
         } else {
-            appearance.text_color = Some(Color::from(cosmic.on_bg_color()));
-        }
+            Color::WHITE
+        });
     } else if cut {
         appearance.text_color = Some(Color::from(
             cosmic.background(theme.transparent).component.on_disabled,
@@ -6317,12 +6319,10 @@ impl Tab {
                     let buttons: Vec<Element<Message>> = vec![
                         icon_element,
                         widget::tooltip(
-                            widget::button::custom(Item::grid_display_name_lines(
+                            widget::button::custom(desktop_or_grid_name(
                                 &item.display_name,
-                                desktop_name_lines(
-                                    matches!(self.mode, Mode::Desktop),
-                                    item.highlighted || item.selected,
-                                ),
+                                matches!(self.mode, Mode::Desktop),
+                                item.highlighted || item.selected,
                             ))
                                 .id(item.button_id.clone())
                                 .padding([0, space_xxxs])
@@ -7996,6 +7996,25 @@ pub(crate) fn scroll_thumb(view: f32, content: f32, offset: f32) -> Option<(f32,
     let travel = view - length;
     let progress = (offset / (content - view)).clamp(0.0, 1.0);
     Some((length, travel * progress))
+}
+
+/// POP Flow: a grid item's name. On the desktop at rest it has no background,
+/// so it is drawn over a dark copy of itself shifted by a pixel — a text shadow,
+/// which iced doesn't have — to stay readable on any wallpaper. Hovered or
+/// selected, and outside the desktop, it's the plain name.
+fn desktop_or_grid_name<'a>(name: &'a str, desktop: bool, revealed: bool) -> Element<'a, Message> {
+    let lines = desktop_name_lines(desktop, revealed);
+    if !desktop || revealed {
+        return Item::grid_display_name_lines(name, lines).into();
+    }
+    let shadow = Item::grid_display_name_lines(name, lines)
+        .class(theme::Text::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.8)));
+    stack![
+        widget::container(shadow).padding(padding::top(1).left(1)),
+        widget::container(Item::grid_display_name_lines(name, lines))
+            .padding(padding::bottom(1).right(1)),
+    ]
+    .into()
 }
 
 /// POP Flow: how many lines of a grid item's name to show. On the desktop,
