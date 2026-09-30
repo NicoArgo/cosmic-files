@@ -58,10 +58,12 @@ elif [ -f "$GOLDEN" ]; then
     echo "   again so a package update can't silently restore the stock desktop."
 fi
 
+# -f with an anchored pattern, not -x: the kernel truncates process names to 15
+# characters, so `pkill -x cosmic-files-applet` never matches anything.
 # cosmic-session respawns it at once, now from the new binary. Only the desktop
 # icons blink; no window is closed.
 echo "==> Reloading the desktop icons..."
-pkill -x cosmic-files-applet 2>/dev/null || true
+pkill -f '^(/usr/bin/)?cosmic-files-applet( |$)' 2>/dev/null || true
 
 echo "==> Done."
 echo "    Note: file-manager windows already open keep the OLD binary. Close all"

@@ -19,7 +19,7 @@ sudo install -m 0755 cosmic-files.orig /usr/bin/cosmic-files
 if [ -f cosmic-files-applet.orig ]; then
     echo "==> Restoring original /usr/bin/cosmic-files-applet (needs sudo)..."
     sudo install -m 0755 cosmic-files-applet.orig /usr/bin/cosmic-files-applet
-    pkill -x cosmic-files-applet 2>/dev/null || true
+    pkill -f '^(/usr/bin/)?cosmic-files-applet( |$)' 2>/dev/null || true
 fi
 
 echo "==> Restored. Close and reopen cosmic-files windows to load the stock binary."

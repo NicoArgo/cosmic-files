@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 #  - cosmic-files-applet draws the desktop and is respawned by cosmic-session.
 COMPONENTS=(
     "cosmic-files|target/release/cosmic-files|:"
-    "cosmic-files-applet|target/release/cosmic-files-applet|pkill -x cosmic-files-applet 2>/dev/null || true"
+    "cosmic-files-applet|target/release/cosmic-files-applet|pkill -f '^(/usr/bin/)?cosmic-files-applet( |$)' 2>/dev/null || true"
 )
 PKG=cosmic-files
 # --------------------------------------------------------------------------
