@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Make POP Flow's cosmic-files survive system/package updates.
 #
-# A package update overwrites /usr/bin/cosmic-files with the stock binary.
+# A package update overwrites /usr/bin/cosmic-files and /usr/bin/cosmic-files-applet
+# (the desktop icons) with the stock binaries.
 # This installs an APT/dpkg post-invoke hook that runs (as root, no password)
 # after every package operation and reinstalls our build whenever the on-disk
 # binary no longer matches our "golden" copy.
@@ -11,12 +12,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # --- component-specific settings ------------------------------------------
-COMP=cosmic-files                         # name under /usr/bin
-PKG=cosmic-files                          # package that owns /usr/bin/$COMP
-BUILT="target/release/cosmic-files"       # our build
-RELOAD=':'   # not session-managed; the user reopens its windows
+# One entry per binary this fork replaces, both owned by the cosmic-files package:
+#   name under /usr/bin | our build | how to reload it after reapplying
+#  - cosmic-files is not session-managed; the user reopens its windows.
+#  - cosmic-files-applet draws the desktop and is respawned by cosmic-session.
+COMPONENTS=(
+    "cosmic-files|target/release/cosmic-files|:"
+    "cosmic-files-applet|target/release/cosmic-files-applet|pkill -x cosmic-files-applet 2>/dev/null || true"
+)
+PKG=cosmic-files
 # --------------------------------------------------------------------------
 
+# Body left unindented: it writes heredocs whose terminators must start the line.
+setup_one() {
+local COMP=$1 BUILT=$2 RELOAD=$3
 LIBDIR=/usr/local/lib/pop-flow
 GOLDEN="$LIBDIR/$COMP"
 REAPPLY="$LIBDIR/reapply-$COMP"
@@ -61,3 +70,9 @@ EOS
 echo "==> Done. POP Flow's $COMP will be reapplied automatically after updates."
 echo "    golden: $GOLDEN"
 echo "    hook:   $HOOK"
+}
+
+for entry in "${COMPONENTS[@]}"; do
+    IFS='|' read -r comp built reload <<<"$entry"
+    setup_one "$comp" "$built" "$reload"
+done

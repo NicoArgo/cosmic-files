@@ -5979,9 +5979,11 @@ impl Tab {
         } = self.config;
 
         let mut grid_spacing = space_xxs;
+        let mut desktop_columns = 0;
         if let Location::Desktop(_path, _output, desktop_config) = &self.location {
             icon_sizes.grid = desktop_config.icon_size;
             grid_spacing = desktop_config.grid_spacing_for(space_xxs);
+            desktop_columns = desktop_config.columns as usize;
         }
 
         let text_height = 3 * 20; // 3 lines of text
@@ -6045,6 +6047,14 @@ impl Tab {
 
         let mut column = widget::column::with_capacity(2);
         if let Some(items) = self.column_sort() {
+            // POP Flow: fixed desktop columns need the total up front, since it
+            // decides how long each column grows once the screen is full.
+            let desktop_total = items
+                .iter()
+                .filter(|(_, item)| item.tree_parent.is_none() && (show_hidden || !item.hidden))
+                .count();
+            let desktop_fixed_columns = (matches!(self.mode, Mode::Desktop) && desktop_columns > 0)
+                .then(|| desktop_columns.min(cols));
             let mut count = 0;
             let mut col = 0;
             let mut row = 0;
@@ -6177,7 +6187,9 @@ impl Tab {
                 }
 
                 count += 1;
-                if matches!(self.mode, Mode::Desktop) {
+                if let Some(columns) = desktop_fixed_columns {
+                    (row, col) = desktop_column_position(count, desktop_total, rows, columns);
+                } else if matches!(self.mode, Mode::Desktop) {
                     row += 1;
                     if row >= page_row + rows {
                         row = 0;
@@ -7718,6 +7730,22 @@ impl Tab {
     }
 }
 
+/// POP Flow: where the `index`-th desktop icon goes when the desktop keeps its
+/// icons in `columns` columns at the left. Each column fills top to bottom; while
+/// everything fits, a column holds as many icons as fit the screen (`rows_fit`),
+/// exactly like upstream. Past that, the columns grow evenly below the screen
+/// and the desktop scrolls instead of spreading icons over the wallpaper.
+pub(crate) fn desktop_column_position(
+    index: usize,
+    total: usize,
+    rows_fit: usize,
+    columns: usize,
+) -> (usize, usize) {
+    let columns = columns.max(1);
+    let rows = rows_fit.max(total.div_ceil(columns)).max(1);
+    (index % rows, index / rows)
+}
+
 pub fn respond_to_scroll_direction(delta: ScrollDelta, modifiers: &Modifiers) -> Option<Message> {
     if !modifiers.control() {
         return None;
@@ -7801,7 +7829,7 @@ mod tests {
 
     use super::{
         Command, HeadingOptions, ItemMetadata, ItemThumbnail, Location, Message, Tab, View,
-        respond_to_scroll_direction, scan_path,
+        desktop_column_position, respond_to_scroll_direction, scan_path,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -7888,6 +7916,35 @@ mod tests {
         trace!("Tab history: {:?}", tab.history);
 
         Ok((fs, tab, dirs))
+    }
+
+
+    #[test]
+    fn desktop_columns_fill_like_upstream_while_they_fit() {
+        // 31 icons, 9 fit a column, 4 columns: 9 + 9 + 9 + 4, as today.
+        let at = |i| desktop_column_position(i, 31, 9, 4);
+        assert_eq!(at(0), (0, 0));
+        assert_eq!(at(8), (8, 0));
+        assert_eq!(at(9), (0, 1));
+        assert_eq!(at(30), (3, 3));
+    }
+
+    #[test]
+    fn desktop_columns_grow_below_the_screen_instead_of_widening() {
+        // 50 icons, 9 fit, 4 columns: 13 per column, never a 5th column.
+        for i in 0..50 {
+            let (row, col) = desktop_column_position(i, 50, 9, 4);
+            assert!(col < 4, "icon {i} spilled into column {col}");
+            assert!(row < 13);
+        }
+        assert_eq!(desktop_column_position(13, 50, 9, 4), (0, 1));
+        assert_eq!(desktop_column_position(49, 50, 9, 4), (10, 3));
+    }
+
+    #[test]
+    fn desktop_columns_survive_degenerate_input() {
+        assert_eq!(desktop_column_position(0, 0, 0, 0), (0, 0));
+        assert_eq!(desktop_column_position(3, 5, 0, 1), (3, 0));
     }
 
     #[test]

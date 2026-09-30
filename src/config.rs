@@ -255,6 +255,11 @@ pub struct DesktopConfig {
     pub show_content: bool,
     pub show_mounted_drives: bool,
     pub show_trash: bool,
+    /// POP Flow: icons stay in this many columns at the left, each filled top
+    /// to bottom; when they no longer fit the screen, the columns grow below it
+    /// and the desktop scrolls. 0 keeps upstream's layout (fill the whole
+    /// width, then page down).
+    pub columns: u16,
 }
 
 impl Default for DesktopConfig {
@@ -265,6 +270,7 @@ impl Default for DesktopConfig {
             show_content: true,
             show_mounted_drives: false,
             show_trash: false,
+            columns: 4,
         }
     }
 }
