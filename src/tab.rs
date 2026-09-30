@@ -2357,10 +2357,20 @@ impl Item {
     fn grid_display_name<'a>(
         name: impl Into<Cow<'a, str>> + 'a,
     ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+        Self::grid_display_name_lines(name, 3)
+    }
+
+    /// POP Flow: the grid name limited to `lines` lines. The desktop shows two
+    /// at rest and the full three on hover or selection, so long names don't
+    /// turn the wallpaper into a wall of text.
+    fn grid_display_name_lines<'a>(
+        name: impl Into<Cow<'a, str>> + 'a,
+        lines: usize,
+    ) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
         widget::text::body(name)
             .wrapping(text::Wrapping::WordOrGlyph)
             .ellipsize(text::Ellipsize::Middle(text::EllipsizeHeightLimit::Lines(
-                3,
+                lines,
             )))
     }
 
@@ -6307,7 +6317,13 @@ impl Tab {
                     let buttons: Vec<Element<Message>> = vec![
                         icon_element,
                         widget::tooltip(
-                            widget::button::custom(Item::grid_display_name(&item.display_name))
+                            widget::button::custom(Item::grid_display_name_lines(
+                                &item.display_name,
+                                desktop_name_lines(
+                                    matches!(self.mode, Mode::Desktop),
+                                    item.highlighted || item.selected,
+                                ),
+                            ))
                                 .id(item.button_id.clone())
                                 .padding([0, space_xxxs])
                                 .class(button_style(
@@ -7982,6 +7998,13 @@ pub(crate) fn scroll_thumb(view: f32, content: f32, offset: f32) -> Option<(f32,
     Some((length, travel * progress))
 }
 
+/// POP Flow: how many lines of a grid item's name to show. On the desktop,
+/// two at rest and all three the cell holds while the icon is hovered or
+/// selected; elsewhere always three, as upstream.
+pub(crate) fn desktop_name_lines(desktop: bool, revealed: bool) -> usize {
+    if desktop && !revealed { 2 } else { 3 }
+}
+
 pub fn respond_to_scroll_direction(delta: ScrollDelta, modifiers: &Modifiers) -> Option<Message> {
     if !modifiers.control() {
         return None;
@@ -8065,7 +8088,7 @@ mod tests {
 
     use super::{
         Command, HeadingOptions, ItemMetadata, ItemThumbnail, Location, Message, Tab, View,
-        respond_to_scroll_direction, scan_path, scroll_thumb,
+        desktop_name_lines, respond_to_scroll_direction, scan_path, scroll_thumb,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -8156,6 +8179,13 @@ mod tests {
 
 
 
+    #[test]
+    fn desktop_names_show_two_lines_until_hovered() {
+        assert_eq!(desktop_name_lines(true, false), 2);
+        assert_eq!(desktop_name_lines(true, true), 3);
+        // Folder windows keep upstream's three lines.
+        assert_eq!(desktop_name_lines(false, false), 3);
+    }
     #[test]
     fn scroll_thumb_only_when_there_is_something_to_scroll() {
         assert_eq!(scroll_thumb(1000.0, 800.0, 0.0), None);
