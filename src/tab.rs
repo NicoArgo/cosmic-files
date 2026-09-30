@@ -6009,6 +6009,49 @@ impl Tab {
         .into()
     }
 
+    /// POP Flow: the desktop's scroll indicator — a thin accent-colored thumb
+    /// at the right edge, only while there is something to scroll. Purely
+    /// visual: it takes no input (so clicks reach the desktop under it);
+    /// scrolling is the wheel, or dragging an icon to the edge.
+    fn desktop_scroll_thumb(&self) -> Option<Element<'static, Message>> {
+        const WIDTH: f32 = 4.0;
+        const MARGIN: f32 = 3.0;
+        let view = self.size_opt.get()?.height;
+        // The laid-out content is the icons plus the grid's bottom padding.
+        let content = self.content_height_opt.get()? + f32::from(theme::spacing().space_xxs);
+        let (length, top) = scroll_thumb(view, content, self.scroll_opt.map_or(0.0, |o| o.y))?;
+        Some(
+            widget::row::with_children([
+                widget::space::horizontal().into(),
+                widget::column::with_children([
+                    widget::space::vertical().height(Length::Fixed(top)).into(),
+                    widget::container(widget::space::vertical())
+                        .width(Length::Fixed(WIDTH))
+                        .height(Length::Fixed(length))
+                        .style(|t: &cosmic::Theme| {
+                            let c = t.cosmic();
+                            widget::container::Style {
+                                background: Some(cosmic::iced::Background::Color(
+                                    c.accent_color().into(),
+                                )),
+                                border: cosmic::iced::core::Border {
+                                    radius: (WIDTH / 2.0).into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }
+                        })
+                        .into(),
+                ])
+                .into(),
+                widget::space::horizontal()
+                    .width(Length::Fixed(MARGIN))
+                    .into(),
+            ])
+            .into(),
+        )
+    }
+
     /// POP Flow: moves the dragged desktop icons (`paths`) to where their
     /// drag image was dropped, snapped to the grid, and saves the layout.
     ///
@@ -7095,19 +7138,32 @@ impl Tab {
             tab_column = tab_column.push(location_view);
         }
         if can_scroll {
-            tab_column = tab_column.push(
-                // FIXME: new responsive widget will remove the state from the scrollable
-                // id_container with custom id forces the state to be extracted in a diff
-                // pre-processing step
-                widget::id_container(
-                    widget::scrollable(popover)
-                        .id(self.scrollable_id.clone())
-                        .on_scroll(Message::Scroll)
-                        .width(Length::Fill)
-                        .height(Length::Fill),
-                    widget::Id::new(format!("{}-scrollable", self.scrollable_id)),
-                ),
-            );
+            let mut scrollable = widget::scrollable(popover)
+                .id(self.scrollable_id.clone())
+                .on_scroll(Message::Scroll)
+                .width(Length::Fill)
+                .height(Length::Fill);
+            // POP Flow: over the wallpaper the stock scrollbar (a dark rail and a
+            // gray thumb) looks like a window part left behind. The desktop
+            // hides it and draws only a thin thumb in the accent color on top.
+            let desktop = matches!(self.mode, Mode::Desktop);
+            if desktop {
+                scrollable = scrollable.direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new().width(0).scroller_width(0).margin(0),
+                ));
+            }
+            // FIXME: new responsive widget will remove the state from the scrollable
+            // id_container with custom id forces the state to be extracted in a diff
+            // pre-processing step
+            let scroll_view: Element<'_, Message> = widget::id_container(
+                scrollable,
+                widget::Id::new(format!("{}-scrollable", self.scrollable_id)),
+            )
+            .into();
+            tab_column = tab_column.push(match self.desktop_scroll_thumb().filter(|_| desktop) {
+                Some(thumb) => Element::from(stack![scroll_view, thumb]),
+                None => scroll_view,
+            });
         } else {
             tab_column = tab_column.push(popover);
         }
@@ -7912,6 +7968,20 @@ impl Tab {
     }
 }
 
+/// POP Flow: length and top offset of a scroll thumb for a `view`-tall
+/// viewport over `content`-tall content scrolled by `offset`, or None when
+/// everything fits. Proportional, never shorter than a grabbable-looking 32 px,
+/// and clamped so an overscroll can't push it off the track.
+pub(crate) fn scroll_thumb(view: f32, content: f32, offset: f32) -> Option<(f32, f32)> {
+    if view <= 0.0 || content <= view + 0.5 {
+        return None;
+    }
+    let length = (view * view / content).clamp(32.0_f32.min(view), view);
+    let travel = view - length;
+    let progress = (offset / (content - view)).clamp(0.0, 1.0);
+    Some((length, travel * progress))
+}
+
 pub fn respond_to_scroll_direction(delta: ScrollDelta, modifiers: &Modifiers) -> Option<Message> {
     if !modifiers.control() {
         return None;
@@ -7995,7 +8065,7 @@ mod tests {
 
     use super::{
         Command, HeadingOptions, ItemMetadata, ItemThumbnail, Location, Message, Tab, View,
-        respond_to_scroll_direction, scan_path,
+        respond_to_scroll_direction, scan_path, scroll_thumb,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -8084,6 +8154,26 @@ mod tests {
         Ok((fs, tab, dirs))
     }
 
+
+
+    #[test]
+    fn scroll_thumb_only_when_there_is_something_to_scroll() {
+        assert_eq!(scroll_thumb(1000.0, 800.0, 0.0), None);
+        assert_eq!(scroll_thumb(1000.0, 1000.0, 0.0), None);
+        assert!(scroll_thumb(1000.0, 1200.0, 0.0).is_some());
+    }
+
+    #[test]
+    fn scroll_thumb_tracks_the_offset() {
+        // Half the content visible: half-length thumb, top at 0, bottom at the end.
+        assert_eq!(scroll_thumb(1000.0, 2000.0, 0.0), Some((500.0, 0.0)));
+        assert_eq!(scroll_thumb(1000.0, 2000.0, 1000.0), Some((500.0, 500.0)));
+        assert_eq!(scroll_thumb(1000.0, 2000.0, 500.0), Some((500.0, 250.0)));
+        // Overscroll stays on the track.
+        assert_eq!(scroll_thumb(1000.0, 2000.0, 5000.0), Some((500.0, 500.0)));
+        // Very long content: the thumb keeps a visible minimum.
+        assert_eq!(scroll_thumb(1000.0, 1_000_000.0, 0.0).unwrap().0, 32.0);
+    }
 
     #[test]
     fn scan_path_succeeds_on_valid_path() -> io::Result<()> {
