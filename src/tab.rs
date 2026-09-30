@@ -742,6 +742,7 @@ pub fn item_from_gvfs_info(path: PathBuf, file_info: gio::FileInfo, sizes: IconS
         rect_opt: Cell::new(None),
         selected: false,
         highlighted: false,
+        hover_scale: 1.0,
         overlaps_drag_rect: false,
         dir_size,
         cut: false,
@@ -876,6 +877,7 @@ pub fn item_from_entry(
         rect_opt: Cell::new(None),
         selected: false,
         highlighted: false,
+        hover_scale: 1.0,
         overlaps_drag_rect: false,
         dir_size,
         cut: false,
@@ -937,6 +939,7 @@ pub fn item_from_trash_entry(
         rect_opt: Cell::new(None),
         selected: false,
         highlighted: false,
+        hover_scale: 1.0,
         overlaps_drag_rect: false,
         dir_size: DirSize::NotDirectory,
         cut: false,
@@ -1406,6 +1409,7 @@ pub fn scan_desktop(
             rect_opt: Cell::new(None),
             selected: false,
             highlighted: false,
+        hover_scale: 1.0,
             overlaps_drag_rect: false,
             dir_size: DirSize::NotDirectory,
             cut: false,
@@ -1834,6 +1838,8 @@ pub enum Message {
     DndLeave(Location),
     /// POP Flow: pointer position of a drag over this tab (surface coords).
     DndMotion(f64, f64),
+    /// POP Flow: an animation frame for the desktop's hover scale.
+    HoverFrame(Instant),
     WindowDrag,
     WindowToggleMaximize,
     ZoomIn,
@@ -2336,6 +2342,9 @@ pub struct Item {
     pub rect_opt: Cell<Option<Rectangle>>,
     pub selected: bool,
     pub highlighted: bool,
+    /// POP Flow: desktop icon scale, animated toward `DESKTOP_HOVER_SCALE`
+    /// while hovered and back to 1.0 after.
+    pub hover_scale: f32,
     pub cut: bool,
     pub overlaps_drag_rect: bool,
     pub dir_size: DirSize,
@@ -2907,6 +2916,8 @@ pub struct Tab {
     desktop_geometry: Cell<Option<desktop_layout::Geometry>>,
     /// POP Flow: last pointer position of a drag over this tab.
     dnd_point: Option<Point>,
+    /// POP Flow: time of the previous hover-scale frame.
+    hover_frame: Option<Instant>,
 }
 
 async fn calculate_dir_size(path: &Path, controller: Controller) -> Result<u64, OperationError> {
@@ -3058,6 +3069,7 @@ impl Tab {
             desktop_cells: RefCell::new(None),
             desktop_geometry: Cell::new(None),
             dnd_point: None,
+            hover_frame: None,
         }
     }
 
@@ -5070,6 +5082,28 @@ impl Tab {
                     ));
                 }
             }
+            Message::HoverFrame(at) => {
+                // Capped, so the first frame after a pause doesn't jump.
+                let dt = self
+                    .hover_frame
+                    .map_or(1.0 / 60.0, |last| at.duration_since(last).as_secs_f32())
+                    .min(1.0 / 30.0);
+                self.hover_frame = Some(at);
+                let step = (DESKTOP_HOVER_SCALE - 1.0) * dt / DESKTOP_HOVER_DURATION;
+                let mut animating = false;
+                for item in self.items_opt.iter_mut().flatten() {
+                    let target = hover_target(item.highlighted);
+                    item.hover_scale = if item.hover_scale < target {
+                        (item.hover_scale + step).min(target)
+                    } else {
+                        (item.hover_scale - step).max(target)
+                    };
+                    animating |= item.hover_scale != target;
+                }
+                if !animating {
+                    self.hover_frame = None;
+                }
+            }
             Message::DndMotion(x, y) => {
                 if matches!(self.mode, Mode::Desktop) {
                     let (x, y) = (x as f32, y as f32);
@@ -6167,8 +6201,15 @@ impl Tab {
         // reserve room for a third — that empty band made rows look far apart.
         let text_height = desktop_name_lines(matches!(self.mode, Mode::Desktop)) as u16 * 20;
         let item_width = (3 * space_xxs + icon_sizes.grid() + 3 * space_xxs) as usize;
-        let item_height =
-            (space_xxxs + icon_sizes.grid() + space_xxxs + text_height + space_xxxs) as usize;
+        // POP Flow: desktop cells hold the hovered (grown) icon, so the scale
+        // never pushes the name or the neighbors around.
+        let hover_room = if matches!(self.mode, Mode::Desktop) {
+            (f32::from(icon_sizes.grid()) * (DESKTOP_HOVER_SCALE - 1.0)).ceil() as u16
+        } else {
+            0
+        };
+        let item_height = (space_xxxs + icon_sizes.grid() + hover_room + space_xxxs + text_height
+            + space_xxxs) as usize;
 
         let (width, height) = match self.size_opt.get() {
             Some(size) => (
@@ -6298,11 +6339,23 @@ impl Tab {
                 // Only build elements if visible (for performance)
                 if item_rect.intersects(&visible_rect) {
                     //TODO: one focus group per grid item (needs custom widget)
-                    let icon_button = widget::button::custom(
+                    let icon: Element<'_, Message> = if hover_room > 0 {
+                        let grown = icon_sizes.grid() + hover_room;
+                        let size = (f32::from(icon_sizes.grid()) * item.hover_scale).round() as u16;
+                        widget::container(
+                            widget::icon::icon(item.icon_handle_grid.clone())
+                                .content_fit(ContentFit::Contain)
+                                .size(size.min(grown)),
+                        )
+                        .center(Length::Fixed(f32::from(grown)))
+                        .into()
+                    } else {
                         widget::icon::icon(item.icon_handle_grid.clone())
                             .content_fit(ContentFit::Contain)
-                            .size(icon_sizes.grid()),
-                    )
+                            .size(icon_sizes.grid())
+                            .into()
+                    };
+                    let icon_button = widget::button::custom(icon)
                     .padding(space_xxxs)
                     .class(button_style(
                         item.selected,
@@ -7978,6 +8031,19 @@ impl Tab {
             ));
         }
 
+        // POP Flow: frames only while a desktop icon is growing or shrinking.
+        if matches!(self.mode, Mode::Desktop)
+            && self
+                .items_opt
+                .iter()
+                .flatten()
+                .any(|item| item.hover_scale != hover_target(item.highlighted))
+        {
+            subscriptions.push(
+                cosmic::iced::window::frames().map(|(_, at)| Message::HoverFrame(at)),
+            );
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -8017,6 +8083,16 @@ fn desktop_or_grid_name<'a>(name: &'a str, desktop: bool, revealed: bool) -> Ele
             .padding(padding::bottom(1).right(1)),
     ]
     .into()
+}
+
+/// POP Flow: how much a desktop icon grows under the pointer, and how long
+/// the growing (or shrinking back) takes, in seconds.
+const DESKTOP_HOVER_SCALE: f32 = 1.15;
+const DESKTOP_HOVER_DURATION: f32 = 0.12;
+
+/// POP Flow: the scale a desktop icon is heading to.
+fn hover_target(highlighted: bool) -> f32 {
+    if highlighted { DESKTOP_HOVER_SCALE } else { 1.0 }
 }
 
 /// POP Flow: how many lines of a grid item's name to show — and to reserve in
