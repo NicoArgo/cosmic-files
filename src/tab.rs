@@ -6163,7 +6163,9 @@ impl Tab {
             desktop_columns = desktop_config.columns as usize;
         }
 
-        let text_height = 3 * 20; // 3 lines of text
+        // POP Flow: the desktop shows names in two lines, so its cells don't
+        // reserve room for a third — that empty band made rows look far apart.
+        let text_height = desktop_name_lines(matches!(self.mode, Mode::Desktop)) as u16 * 20;
         let item_width = (3 * space_xxs + icon_sizes.grid() + 3 * space_xxs) as usize;
         let item_height =
             (space_xxxs + icon_sizes.grid() + space_xxxs + text_height + space_xxxs) as usize;
@@ -8003,7 +8005,7 @@ pub(crate) fn scroll_thumb(view: f32, content: f32, offset: f32) -> Option<(f32,
 /// which iced doesn't have — to stay readable on any wallpaper. Hovered or
 /// selected, and outside the desktop, it's the plain name.
 fn desktop_or_grid_name<'a>(name: &'a str, desktop: bool, revealed: bool) -> Element<'a, Message> {
-    let lines = desktop_name_lines(desktop, revealed);
+    let lines = desktop_name_lines(desktop);
     if !desktop || revealed {
         return Item::grid_display_name_lines(name, lines).into();
     }
@@ -8017,11 +8019,11 @@ fn desktop_or_grid_name<'a>(name: &'a str, desktop: bool, revealed: bool) -> Ele
     .into()
 }
 
-/// POP Flow: how many lines of a grid item's name to show. On the desktop,
-/// two at rest and all three the cell holds while the icon is hovered or
-/// selected; elsewhere always three, as upstream.
-pub(crate) fn desktop_name_lines(desktop: bool, revealed: bool) -> usize {
-    if desktop && !revealed { 2 } else { 3 }
+/// POP Flow: how many lines of a grid item's name to show — and to reserve in
+/// the cell. Two on the desktop (the full name is in the tooltip), three
+/// elsewhere, as upstream.
+pub(crate) fn desktop_name_lines(desktop: bool) -> usize {
+    if desktop { 2 } else { 3 }
 }
 
 pub fn respond_to_scroll_direction(delta: ScrollDelta, modifiers: &Modifiers) -> Option<Message> {
@@ -8199,11 +8201,10 @@ mod tests {
 
 
     #[test]
-    fn desktop_names_show_two_lines_until_hovered() {
-        assert_eq!(desktop_name_lines(true, false), 2);
-        assert_eq!(desktop_name_lines(true, true), 3);
+    fn desktop_names_take_two_lines() {
+        assert_eq!(desktop_name_lines(true), 2);
         // Folder windows keep upstream's three lines.
-        assert_eq!(desktop_name_lines(false, false), 3);
+        assert_eq!(desktop_name_lines(false), 3);
     }
     #[test]
     fn scroll_thumb_only_when_there_is_something_to_scroll() {
