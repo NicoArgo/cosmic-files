@@ -26,7 +26,7 @@ use icu::locale::preferences::extensions::unicode::keywords::HourCycle;
 use image::{DynamicImage, ImageReader};
 use jiff_icu::ConvertFrom;
 use mime_guess::{Mime, mime};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs::{self, File, Metadata};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -279,6 +279,46 @@ fn button_style(
                 desktop,
             )
         }),
+    }
+}
+
+/// What the Size column sorts by: whether the row counts entries (folders)
+/// rather than bytes, and that count or size.
+fn size_sort_key(item: &Item) -> (bool, u64) {
+    match &item.metadata {
+        ItemMetadata::Path {
+            metadata,
+            children_opt,
+        } => {
+            if metadata.is_dir() {
+                (true, children_opt.unwrap_or_default() as u64)
+            } else {
+                (false, metadata.len())
+            }
+        }
+        ItemMetadata::Trash { metadata, .. } => match metadata.size {
+            trash::TrashItemSize::Entries(entries) => (true, entries as u64),
+            trash::TrashItemSize::Bytes(bytes) => (false, bytes),
+        },
+        ItemMetadata::SimpleDir { entries } => (true, *entries),
+        ItemMetadata::SimpleFile { size } => (false, *size),
+        #[cfg(feature = "gvfs")]
+        ItemMetadata::GvfsPath {
+            size_opt,
+            children_opt,
+            ..
+        } => match children_opt {
+            Some(child_count) => (true, *child_count as u64),
+            None => (false, size_opt.unwrap_or_default()),
+        },
+    }
+}
+
+/// What the Trashed On column sorts by.
+fn time_deleted(item: &Item) -> Option<i64> {
+    match &item.metadata {
+        ItemMetadata::Trash { entry, .. } => Some(entry.time_deleted),
+        _ => None,
     }
 }
 
@@ -2896,6 +2936,10 @@ pub struct Tab {
     /// `tree_remember` is off, navigation as well, so coming back to a
     /// directory reopens the folders that were open before.
     pub(crate) expanded: FxHashSet<PathBuf>,
+    /// POP Flow: the last display order from [`Self::column_sort`], keyed by a
+    /// fingerprint of everything that decides it. The views ask for the order
+    /// on every redraw, and sorting 10k rows takes ~5 ms.
+    order_cache: RefCell<Option<(u64, Box<[usize]>)>>,
     pub dnd_hovered: Option<(Location, Instant)>,
     pub(crate) scrollable_id: widget::Id,
     select_focus: Option<usize>,
@@ -3053,6 +3097,7 @@ impl Tab {
             parent_item_opt: None,
             items_opt: None,
             expanded: FxHashSet::default(),
+            order_cache: RefCell::new(None),
             scrollable_id,
             select_focus: None,
             select_range: None,
@@ -5297,6 +5342,60 @@ impl Tab {
     /// folder follow their parent, and the chosen sort applies within every set
     /// of siblings rather than across the whole flat list.
     fn column_sort(&self) -> Option<Vec<(usize, &Item)>> {
+        // POP Flow: reuse the last order while nothing it depends on changed.
+        let all = self.items_opt.as_ref()?;
+        let key = self.order_fingerprint(all);
+        if let Some((cached_key, order)) = &*self.order_cache.borrow()
+            && *cached_key == key
+        {
+            return Some(order.iter().map(|&i| (i, &all[i])).collect());
+        }
+        let sorted = self.column_sort_uncached()?;
+        *self.order_cache.borrow_mut() = Some((key, sorted.iter().map(|(i, _)| *i).collect()));
+        Some(sorted)
+    }
+
+    /// POP Flow: a hash of every input to [`Self::column_sort_uncached`] — the
+    /// sort options, the tree settings and, per row in storage order, each
+    /// field the sort or the tree walk reads. Hashing is linear and allocation
+    /// free, far cheaper than the collation-based sort it lets us skip, and
+    /// it cannot go stale the way invalidating at each of the many places that
+    /// touch `items_opt` could.
+    fn order_fingerprint(&self, items: &[Item]) -> u64 {
+        let mut hasher = FxHasher::default();
+        self.sort_options().hash(&mut hasher);
+        self.tree_enabled().hash(&mut hasher);
+        self.config.show_hidden.hash(&mut hasher);
+        // The set has no order; combine its members order-independently.
+        let mut expanded = 0u64;
+        for path in &self.expanded {
+            let mut path_hasher = FxHasher::default();
+            path.as_os_str().as_encoded_bytes().hash(&mut path_hasher);
+            expanded = expanded.wrapping_add(path_hasher.finish());
+        }
+        (self.expanded.len(), expanded).hash(&mut hasher);
+
+        items.len().hash(&mut hasher);
+        for item in items {
+            item.display_name.hash(&mut hasher);
+            item.hidden.hash(&mut hasher);
+            item.metadata.is_dir().hash(&mut hasher);
+            item.metadata.modified().hash(&mut hasher);
+            size_sort_key(item).hash(&mut hasher);
+            time_deleted(item).hash(&mut hasher);
+            item.path_opt()
+                .map(|path| path.as_os_str().as_encoded_bytes())
+                .hash(&mut hasher);
+            item.tree_parent
+                .as_ref()
+                .map(|path| path.as_os_str().as_encoded_bytes())
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// The display order, always computed from scratch.
+    fn column_sort_uncached(&self) -> Option<Vec<(usize, &Item)>> {
         let items = self.sort_indexed()?;
         if !self.tree_enabled() {
             return Some(items);
@@ -5345,35 +5444,8 @@ impl Tab {
             HeadingOptions::Size => {
                 items.sort_by(|a, b| {
                     // entries take precedence over size
-                    let get_size = |x: &Item| match &x.metadata {
-                        ItemMetadata::Path {
-                            metadata,
-                            children_opt,
-                        } => {
-                            if metadata.is_dir() {
-                                (true, children_opt.unwrap_or_default() as u64)
-                            } else {
-                                (false, metadata.len())
-                            }
-                        }
-                        ItemMetadata::Trash { metadata, .. } => match metadata.size {
-                            trash::TrashItemSize::Entries(entries) => (true, entries as u64),
-                            trash::TrashItemSize::Bytes(bytes) => (false, bytes),
-                        },
-                        ItemMetadata::SimpleDir { entries } => (true, *entries),
-                        ItemMetadata::SimpleFile { size } => (false, *size),
-                        #[cfg(feature = "gvfs")]
-                        ItemMetadata::GvfsPath {
-                            size_opt,
-                            children_opt,
-                            ..
-                        } => match children_opt {
-                            Some(child_count) => (true, *child_count as u64),
-                            None => (false, size_opt.unwrap_or_default()),
-                        },
-                    };
-                    let (a_is_entry, a_size) = get_size(a.1);
-                    let (b_is_entry, b_size) = get_size(b.1);
+                    let (a_is_entry, a_size) = size_sort_key(a.1);
+                    let (b_is_entry, b_size) = size_sort_key(b.1);
 
                     //TODO: use folders_first?
                     match (a_is_entry, b_is_entry) {
@@ -5416,11 +5488,6 @@ impl Tab {
                 });
             }
             HeadingOptions::TrashedOn => {
-                let time_deleted = |x: &Item| match &x.metadata {
-                    ItemMetadata::Trash { entry, .. } => Some(entry.time_deleted),
-                    _ => None,
-                };
-
                 items.sort_by(|a, b| {
                     let a_time_deleted = time_deleted(a.1);
                     let b_time_deleted = time_deleted(b.1);
@@ -8878,6 +8945,113 @@ mod tests {
         tab.change_location(&home, None);
 
         assert!(tab.expanded.is_empty());
+        Ok(())
+    }
+
+    /// The cached order must always be the order a fresh sort would give,
+    /// whatever changed in between.
+    #[test]
+    fn tree_order_cache_matches_a_fresh_sort() -> io::Result<()> {
+        let (_fs, mut tab, dir, _children) = tree_tab()?;
+        let order = |tab: &Tab| {
+            let cached: Vec<usize> = tab.column_sort().unwrap().iter().map(|e| e.0).collect();
+            let fresh: Vec<usize> = tab
+                .column_sort_uncached()
+                .unwrap()
+                .iter()
+                .map(|e| e.0)
+                .collect();
+            assert_eq!(cached, fresh);
+            cached
+        };
+        let flat = order(&tab);
+
+        expand(&mut tab, &dir);
+        let expanded = order(&tab);
+        assert_ne!(flat, expanded, "expanding should change the order");
+
+        tab.update(
+            Message::ToggleSort(HeadingOptions::Name),
+            Modifiers::empty(),
+        );
+        order(&tab);
+
+        tab.config.show_hidden = !tab.config.show_hidden;
+        order(&tab);
+
+        // An in-place rename, with no rescan: the last top-level row moves
+        // first once the sort is ascending again.
+        let last = *order(&tab)
+            .iter()
+            .rev()
+            .find(|&&i| tab.items_opt().unwrap()[i].tree_parent.is_none())
+            .unwrap();
+        tab.items_opt_mut().unwrap()[last].display_name = String::new();
+        tab.update(
+            Message::ToggleSort(HeadingOptions::Name),
+            Modifiers::empty(),
+        );
+        tab.config.folders_first = false;
+        assert_eq!(order(&tab).first(), Some(&last));
+
+        let index = tab_index_of(&tab, &dir);
+        tab.update(Message::ToggleExpand(index), Modifiers::empty());
+        order(&tab);
+        Ok(())
+    }
+
+    /// Timing, not correctness: `cargo test --release -- --ignored
+    /// --nocapture tree_sort_10k`. About 10,000 rows, a fifth of them inside
+    /// expanded subfolders, ordered the way `list_view` orders them.
+    #[test]
+    #[ignore]
+    fn tree_sort_10k() -> io::Result<()> {
+        let fs = TempDir::new()?;
+        let root = fs.path().to_path_buf();
+        for i in 0..8_000 {
+            fs::File::create(root.join(format!("file {i:05}.txt")))?;
+        }
+        let mut dirs = Vec::new();
+        for d in 0..20 {
+            let dir = root.join(format!("dir {d:02}"));
+            fs::create_dir(&dir)?;
+            for i in 0..100 {
+                fs::File::create(dir.join(format!("nested {i:03}.txt")))?;
+            }
+            dirs.push(dir);
+        }
+
+        let mut tab = Tab::new(
+            Location::Path(root.clone()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        tab.config.view = View::List;
+        tab.set_items(scan_path(&root, IconSizes::default()));
+        for dir in &dirs {
+            tab.expanded.insert(dir.clone());
+            tab.set_tree_children(dir, scan_path(dir, IconSizes::default()));
+        }
+        let rows = tab.items_opt().expect("tab should have items").len();
+        assert_eq!(rows, 10_020);
+
+        const RUNS: u32 = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let sorted = tab.column_sort_uncached().expect("tab should have items");
+            assert_eq!(sorted.len(), rows);
+        }
+        let uncached = start.elapsed() / RUNS;
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let sorted = tab.column_sort().expect("tab should have items");
+            assert_eq!(sorted.len(), rows);
+        }
+        let cached = start.elapsed() / RUNS;
+        println!("{rows} rows: sorted {uncached:?}, cached {cached:?} per call");
         Ok(())
     }
 }
