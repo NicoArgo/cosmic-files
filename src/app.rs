@@ -330,6 +330,7 @@ pub enum NavMenuAction {
     RunContextAction(segmented_button::Entity, usize),
     RemoveFromSidebar(segmented_button::Entity),
     OpenInTerminal(segmented_button::Entity),
+    FolderRule(segmented_button::Entity),
 }
 
 impl MenuAction for NavMenuAction {
@@ -851,6 +852,28 @@ impl App {
         } else {
             t
         }
+    }
+
+    /// POP Flow: open the folder rule dialog for `path`, prefilled from its
+    /// exact rule if it has one. Shared by the item and sidebar menus.
+    fn folder_rule_dialog(&mut self, path: PathBuf) -> Task<Message> {
+        let rules = crate::folder_color::TermRules::load();
+        let rule = rules.exact(&path);
+        let page = DialogPage::FolderRule {
+            name: rule
+                .and_then(|rule| rule.tab_title.clone())
+                .unwrap_or_default(),
+            accent: rule
+                .and_then(|rule| rule.accent.clone())
+                .unwrap_or_default(),
+            include_subdirs: rule.is_some_and(|rule| rule.include_subdirs),
+            existing: rule.is_some(),
+            path,
+        };
+        Task::batch([
+            self.dialog_pages.push_back(page),
+            widget::text_input::focus(self.dialog_text_input.clone()),
+        ])
     }
 
     fn open_file(&mut self, paths: &[impl AsRef<Path>]) -> Task<Message> {
@@ -2888,6 +2911,17 @@ impl Application for App {
                     NavMenuAction::OpenInTerminal(entity),
                 ));
             }
+            // POP Flow: "Folder rule..." for local sidebar folders.
+            if crate::folder_color::term_edits_rules()
+                && let Some(Location::Path(path)) = location_opt
+                && path.is_dir()
+            {
+                items.push(cosmic::widget::menu::Item::Button(
+                    fl!("folder-rule"),
+                    None,
+                    NavMenuAction::FolderRule(entity),
+                ));
+            }
             if let Some(path) = location_opt.and_then(Location::path_opt) {
                 let selected_dir = usize::from(path.is_dir());
                 let action_items: Vec<_> = self
@@ -4631,24 +4665,7 @@ impl Application for App {
                     .filter(|path| path.is_dir())
                     .collect();
                 if let [path] = &paths[..] {
-                    let path = path.clone();
-                    let rules = crate::folder_color::TermRules::load();
-                    let rule = rules.exact(&path);
-                    let page = DialogPage::FolderRule {
-                        name: rule
-                            .and_then(|rule| rule.tab_title.clone())
-                            .unwrap_or_default(),
-                        accent: rule
-                            .and_then(|rule| rule.accent.clone())
-                            .unwrap_or_default(),
-                        include_subdirs: rule.is_some_and(|rule| rule.include_subdirs),
-                        existing: rule.is_some(),
-                        path,
-                    };
-                    return Task::batch([
-                        self.dialog_pages.push_back(page),
-                        widget::text_input::focus(self.dialog_text_input.clone()),
-                    ]);
+                    return self.folder_rule_dialog(path.clone());
                 }
             }
             Message::FolderRuleRemove(path) => {
@@ -5639,6 +5656,18 @@ impl Application for App {
                                 err
                             );
                         }
+                    }
+                }
+                NavMenuAction::FolderRule(entity) => {
+                    // POP Flow: same dialog as the item context menu.
+                    if let Some(path) = self
+                        .nav_model
+                        .data::<Location>(entity)
+                        .and_then(Location::path_opt)
+                        .filter(|path| path.is_dir())
+                        .cloned()
+                    {
+                        return self.folder_rule_dialog(path);
                     }
                 }
                 NavMenuAction::OpenWith(entity) => {
