@@ -456,6 +456,7 @@ enum Message {
     Escape,
     Filename(String),
     Filter(usize),
+    FolderRules(crate::folder_color::TermRules),
     Key(Modifiers, Key, Physical, Option<SmolStr>),
     ModifiersChanged(Modifiers),
     MounterItems(MounterKey, MounterItems),
@@ -1992,6 +1993,13 @@ impl Application for App {
                     config.view = view;
                 });
             }
+            Message::FolderRules(rules) => {
+                // POP Flow: repaint folder colors live, like the main window.
+                if crate::folder_color::set_rules(&rules) {
+                    self.tab.refresh_folder_icons();
+                    self.update_nav_model();
+                }
+            }
             Message::TimeConfigChange(time_config) => {
                 self.flags.config.tab.military_time = time_config.military_time;
                 return self.update_config();
@@ -2064,6 +2072,7 @@ impl Application for App {
     fn subscription(&self) -> Subscription<Message> {
         struct WatcherSubscription;
         struct TimeSubscription;
+        struct FolderRulesSubscription;
         let mut subscriptions = vec![
             event::listen_with(|event, status, window_id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(button)) => match status {
@@ -2118,6 +2127,14 @@ impl Application for App {
                 }
                 Message::TimeConfigChange(update.config)
             }),
+            // POP Flow: folder colors live in the terminal's rules; follow them
+            // live here too, as the main window does.
+            cosmic_config::config_subscription::<_, crate::folder_color::TermRules>(
+                TypeId::of::<FolderRulesSubscription>(),
+                crate::folder_color::TERM_CONFIG_ID.into(),
+                crate::folder_color::TERM_CONFIG_VERSION,
+            )
+            .map(|update| Message::FolderRules(update.config)),
             Subscription::run_with(TypeId::of::<WatcherSubscription>(), |_| {
                 stream::channel(100, {
                     |mut output: futures::channel::mpsc::Sender<_>| async move {
