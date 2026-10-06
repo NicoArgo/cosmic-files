@@ -176,6 +176,7 @@ quit = Sair
 edit = Editar
 cut = Cortar
 copy = Copiar
+copy-path = Copiar caminho
 paste = Colar
 select-all = Selecionar tudo
 

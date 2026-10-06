@@ -216,11 +216,10 @@ pub fn context_menu<'a>(
                 children.push(divider::horizontal::light().into());
                 children.push(menu_item(fl!("rename"), Action::Rename).into());
                 children.push(menu_item(fl!("cut"), Action::Cut).into());
-                if modifiers.shift() && !modifiers.control() {
-                    children.push(menu_item(fl!("copy-path"), Action::CopyPath).into());
-                } else {
-                    children.push(menu_item(fl!("copy"), Action::Copy).into());
-                }
+                // POP Flow: "Copy path" always sits right after Copy, not only
+                // with Shift held.
+                children.push(menu_item(fl!("copy"), Action::Copy).into());
+                children.push(menu_item(fl!("copy-path"), Action::CopyPath).into());
                 // Should this simply bypass trash and remove the shortcut?
                 children.push(menu_item(fl!("move-to-trash"), Action::Delete).into());
                 let action_items = context_action_items(selected, selected_dir);
@@ -267,11 +266,10 @@ pub fn context_menu<'a>(
                     }
                     children.push(menu_item(fl!("cut"), Action::Cut).into());
                 }
-                if modifiers.shift() && !modifiers.control() {
-                    children.push(menu_item(fl!("copy-path"), Action::CopyPath).into());
-                } else {
-                    children.push(menu_item(fl!("copy"), Action::Copy).into());
-                }
+                // POP Flow: "Copy path" always sits right after Copy, not only
+                // with Shift held.
+                children.push(menu_item(fl!("copy"), Action::Copy).into());
+                children.push(menu_item(fl!("copy-path"), Action::CopyPath).into());
                 if selected_mount_point == 0 {
                     children.push(menu_item(fl!("move-to"), Action::MoveTo).into());
                 }
