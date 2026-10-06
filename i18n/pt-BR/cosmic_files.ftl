@@ -453,3 +453,12 @@ rename-confirm = Renomear
 checksum = Soma de verificação { $kind }
 calculate = Calcular
 error = Erro
+
+# POP Flow: regras de pasta pelo menu de contexto
+folder-rule = Regra da pasta...
+folder-rule-title = Regra da pasta
+folder-rule-name = Nome
+folder-rule-color = Cor
+folder-rule-subdirs = Aplicar também às subpastas
+folder-rule-remove = Remover regra
+folder-rule-invalid-color = A cor deve ser #rrggbb

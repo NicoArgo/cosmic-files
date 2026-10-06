@@ -258,6 +258,13 @@ pub fn context_menu<'a>(
                 children.push(divider::horizontal::light().into());
                 if selected_mount_point == 0 {
                     children.push(menu_item(fl!("rename"), Action::Rename).into());
+                    // POP Flow: the folder's name and color, without opening the
+                    // terminal's settings. Only when the installed terminal can
+                    // write the rule (the stock one cannot).
+                    if selected == 1 && selected_dir == 1 && crate::folder_color::term_edits_rules()
+                    {
+                        children.push(menu_item(fl!("folder-rule"), Action::FolderRule).into());
+                    }
                     children.push(menu_item(fl!("cut"), Action::Cut).into());
                 }
                 if modifiers.shift() && !modifiers.control() {

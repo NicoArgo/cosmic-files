@@ -177,6 +177,7 @@ pub enum Action {
     Reload,
     RemoveFromRecents,
     Rename,
+    FolderRule,
     RestoreFromTrash,
     SearchActivate,
     SelectFirst,
@@ -257,6 +258,7 @@ impl Action {
             Self::Reload => Message::TabMessage(entity_opt, tab::Message::Reload),
             Self::RemoveFromRecents => Message::RemoveFromRecents(entity_opt),
             Self::Rename => Message::Rename(entity_opt),
+            Self::FolderRule => Message::FolderRule(entity_opt),
             Self::RestoreFromTrash => Message::RestoreFromTrash(entity_opt),
             Self::SearchActivate => Message::SearchActivate,
             Self::SelectAll => Message::TabMessage(entity_opt, tab::Message::SelectAll),
@@ -436,6 +438,8 @@ pub enum Message {
     RescanTrash,
     RemoveFromRecents(Option<Entity>),
     Rename(Option<Entity>),
+    FolderRule(Option<Entity>),
+    FolderRuleRemove(PathBuf),
     ReplaceResult(ReplaceResult),
     RestoreFromTrash(Option<Entity>),
     SaveSortNames,
@@ -595,6 +599,15 @@ pub enum DialogPage {
         parent: PathBuf,
         name: String,
         dir: bool,
+    },
+    /// POP Flow: a folder's identity — the name and color its terminal rule
+    /// gives it. Saved through `cosmic-term --set-rule`.
+    FolderRule {
+        path: PathBuf,
+        name: String,
+        accent: String,
+        include_subdirs: bool,
+        existing: bool,
     },
     Replace {
         from: Box<tab::Item>,
@@ -3577,6 +3590,24 @@ impl Application for App {
                             let to = parent.join(name);
                             tasks.push(self.operation(Operation::Rename { from, to }));
                         }
+                        DialogPage::FolderRule {
+                            path,
+                            name,
+                            accent,
+                            include_subdirs,
+                            ..
+                        } => {
+                            let args = crate::folder_color::set_rule_args(
+                                &path,
+                                &name,
+                                &accent,
+                                include_subdirs,
+                            );
+                            tasks.push(Task::future(async move {
+                                crate::folder_color::run_term(args).await;
+                                cosmic::action::none()
+                            }));
+                        }
                         DialogPage::Replace { .. } => {
                             log::warn!("replace dialog should be completed with replace result");
                         }
@@ -4591,6 +4622,48 @@ impl Application for App {
                         ]);
                         return Task::batch(tasks);
                     }
+                }
+            }
+            Message::FolderRule(entity_opt) => {
+                // One folder at a time: the dialog edits a single identity.
+                let paths: Vec<_> = self
+                    .selected_paths(entity_opt)
+                    .filter(|path| path.is_dir())
+                    .collect();
+                if let [path] = &paths[..] {
+                    let path = path.clone();
+                    let rules = crate::folder_color::TermRules::load();
+                    let rule = rules.exact(&path);
+                    let page = DialogPage::FolderRule {
+                        name: rule
+                            .and_then(|rule| rule.tab_title.clone())
+                            .unwrap_or_default(),
+                        accent: rule
+                            .and_then(|rule| rule.accent.clone())
+                            .unwrap_or_default(),
+                        include_subdirs: rule.is_some_and(|rule| rule.include_subdirs),
+                        existing: rule.is_some(),
+                        path,
+                    };
+                    return Task::batch([
+                        self.dialog_pages.push_back(page),
+                        widget::text_input::focus(self.dialog_text_input.clone()),
+                    ]);
+                }
+            }
+            Message::FolderRuleRemove(path) => {
+                if let Some((_page, task)) = self.dialog_pages.pop_front() {
+                    return Task::batch([
+                        task,
+                        Task::future(async move {
+                            crate::folder_color::run_term(vec![
+                                "--remove-rule".into(),
+                                path.into(),
+                            ])
+                            .await;
+                            cosmic::action::none()
+                        }),
+                    ]);
                 }
             }
             Message::ReplaceResult(replace_result) => {
@@ -6692,6 +6765,133 @@ impl Application for App {
                         widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                     )
                     .control(control)
+            }
+            DialogPage::FolderRule {
+                path,
+                name,
+                accent,
+                include_subdirs,
+                existing,
+            } => {
+                let update = move |name: String, accent: String, include_subdirs: bool| {
+                    Message::DialogUpdate(DialogPage::FolderRule {
+                        path: path.clone(),
+                        name,
+                        accent,
+                        include_subdirs,
+                        existing: *existing,
+                    })
+                };
+                let folder_name = path
+                    .file_name()
+                    .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy())
+                    .into_owned();
+                let rgb = crate::folder_color::Rgb::parse(accent);
+                // A rule may carry no color (just a name); only a half-typed hex
+                // blocks saving.
+                let valid = accent.trim().is_empty() || rgb.is_some();
+                let complete_maybe = valid.then_some(Message::DialogComplete);
+
+                let preview: Element<_> = match rgb {
+                    Some(rgb) => widget::icon(crate::folder_color::colored_icon("folder", 64, rgb))
+                        .size(64)
+                        .into(),
+                    None => widget::icon::from_name("folder").size(64).icon().into(),
+                };
+                let header = widget::row::with_children([
+                    preview,
+                    widget::column::with_children([
+                        widget::text::title4(if name.trim().is_empty() {
+                            folder_name.clone()
+                        } else {
+                            name.trim().to_string()
+                        })
+                        .into(),
+                        widget::text::caption(path.to_string_lossy().into_owned()).into(),
+                    ])
+                    .spacing(space_xxs)
+                    .into(),
+                ])
+                .spacing(space_s)
+                .align_y(Alignment::Center);
+
+                let swatches = widget::row::with_children(
+                    crate::folder_color::PRESETS
+                        .iter()
+                        .map(|hex| {
+                            let color = crate::folder_color::Rgb::parse(hex).unwrap();
+                            let selected = rgb == Some(color);
+                            let swatch = widget::container(
+                                widget::Space::new()
+                                    .width(Length::Fixed(24.0))
+                                    .height(Length::Fixed(24.0)),
+                            )
+                            .style(move |theme: &cosmic::Theme| widget::container::Style {
+                                background: Some(color.color().into()),
+                                border: cosmic::iced::Border {
+                                    radius: 12.0.into(),
+                                    width: if selected { 3.0 } else { 0.0 },
+                                    color: theme.cosmic().on_bg_color().into(),
+                                },
+                                ..Default::default()
+                            });
+                            widget::mouse_area(swatch)
+                                .on_press(update(
+                                    name.clone(),
+                                    (*hex).to_string(),
+                                    *include_subdirs,
+                                ))
+                                .into()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(space_xxs)
+                .wrap();
+
+                let mut dialog = widget::dialog()
+                    .title(fl!("folder-rule-title"))
+                    .primary_action(
+                        widget::button::suggested(fl!("save")).on_press_maybe(complete_maybe.clone()),
+                    )
+                    .secondary_action(
+                        widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
+                    )
+                    .control(
+                        widget::column::with_children([
+                            header.into(),
+                            widget::text::body(fl!("folder-rule-name")).into(),
+                            widget::text_input(folder_name.to_uppercase(), name.as_str())
+                                .id(self.dialog_text_input.clone())
+                                .on_input(move |name| {
+                                    update(name, accent.clone(), *include_subdirs)
+                                })
+                                .on_submit_maybe(
+                                    complete_maybe.clone().map(|maybe| move |_| maybe.clone()),
+                                )
+                                .into(),
+                            widget::text::body(fl!("folder-rule-color")).into(),
+                            swatches.into(),
+                            widget::text_input("#rrggbb", accent.as_str())
+                                .on_input(move |accent| update(name.clone(), accent, *include_subdirs))
+                                .on_submit_maybe(complete_maybe.map(|maybe| move |_| maybe.clone()))
+                                .into(),
+                            widget::checkbox(*include_subdirs)
+                                .label(fl!("folder-rule-subdirs"))
+                                .on_toggle(move |value| update(name.clone(), accent.clone(), value))
+                                .into(),
+                        ])
+                        .spacing(space_xxs),
+                    );
+                if *existing {
+                    dialog = dialog.tertiary_action(
+                        widget::button::text(fl!("folder-rule-remove"))
+                            .on_press(Message::FolderRuleRemove(path.clone())),
+                    );
+                } else if !valid {
+                    dialog = dialog
+                        .tertiary_action(widget::text::body(fl!("folder-rule-invalid-color")));
+                }
+                dialog
             }
             DialogPage::Replace {
                 from,

@@ -25,13 +25,16 @@ use std::{
 pub const TERM_CONFIG_ID: &str = "com.system76.CosmicTerm";
 pub const TERM_CONFIG_VERSION: u64 = 1;
 
-/// The subset of the terminal's `DirRule` that says where a color goes.
+/// The subset of the terminal's `DirRule` that says where a color goes, plus
+/// the name, which the "Folder rule" dialog shows. Read only: changes go
+/// through the terminal (see [`set_rule_args`]), which owns the rest of the fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct TermDirRule {
     pub path: String,
     pub include_subdirs: bool,
     pub enabled: bool,
+    pub tab_title: Option<String>,
     pub accent: Option<String>,
 }
 
@@ -41,6 +44,7 @@ impl Default for TermDirRule {
             path: String::new(),
             include_subdirs: false,
             enabled: true,
+            tab_title: None,
             accent: None,
         }
     }
@@ -64,6 +68,75 @@ impl TermRules {
                 Self::default()
             }
         }
+    }
+
+    /// The rule set on `dir` itself — not one reaching it from a parent, since
+    /// that is the rule the dialog edits.
+    pub fn exact(&self, dir: &Path) -> Option<&TermDirRule> {
+        self.dir_rules
+            .values()
+            .find(|rule| absolute_path(&rule.path).as_deref() == Some(dir))
+    }
+}
+
+/// Colors offered as one-click swatches in the "Folder rule" dialog. Any other
+/// color can still be typed as hex.
+pub const PRESETS: [&str; 12] = [
+    "#E53935", "#FB8C00", "#FDD835", "#7CB342", "#43A047", "#48B9C7", "#1E88E5", "#3949AB",
+    "#8E24AA", "#D81B60", "#6D4C41", "#757575",
+];
+
+/// Whether the installed terminal can write rules for us (`--set-rule`). The
+/// stock one cannot: it would ignore the flag and open a window instead, so
+/// the menu entry is only offered when the help text lists it. Asked once.
+pub fn term_edits_rules() -> bool {
+    static CAN: LazyLock<bool> = LazyLock::new(|| {
+        std::process::Command::new("cosmic-term")
+            .arg("--help")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("--set-rule"))
+    });
+    *CAN
+}
+
+/// Arguments for `cosmic-term` that give `dir` this identity. Empty name or
+/// color means "none of its own".
+pub fn set_rule_args(
+    dir: &Path,
+    name: &str,
+    accent: &str,
+    include_subdirs: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec!["--set-rule".into(), dir.into()];
+    if !name.trim().is_empty() {
+        args.extend(["--name".into(), name.trim().into()]);
+    }
+    if let Some(rgb) = Rgb::parse(accent) {
+        args.extend(["--accent".into(), rgb.hex().into()]);
+    }
+    if include_subdirs {
+        args.push("--subdirs".into());
+    }
+    args
+}
+
+/// Run `cosmic-term` with `args` to change the rules. The file is watched, so
+/// the new color reaches every view on its own once this returns.
+pub async fn run_term(args: Vec<std::ffi::OsString>) {
+    match tokio::process::Command::new("cosmic-term")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => log::warn!(
+            "cosmic-term {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(err) => log::warn!("failed to run cosmic-term: {err}"),
     }
 }
 
@@ -274,18 +347,76 @@ pub fn tint_symbolic(icon: widget::icon::Icon, dir: &Path) -> widget::icon::Icon
 mod tests {
     use super::*;
 
+    #[test]
+    fn exact_finds_only_the_folders_own_rule() {
+        let rules = TermRules {
+            dir_rules: [
+                (1, rule("/home/nico/flow/", true, "#112233")),
+                (2, rule("/home/nico/flow/sub", false, "#445566")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        // A trailing slash is the same folder.
+        assert_eq!(
+            rules
+                .exact(Path::new("/home/nico/flow"))
+                .unwrap()
+                .accent
+                .as_deref(),
+            Some("#112233")
+        );
+        assert_eq!(
+            rules
+                .exact(Path::new("/home/nico/flow/sub"))
+                .unwrap()
+                .accent
+                .as_deref(),
+            Some("#445566")
+        );
+        // Covered through a parent's include_subdirs is not a rule of its own.
+        assert!(rules.exact(Path::new("/home/nico/flow/other")).is_none());
+    }
+
+    #[test]
+    fn set_rule_args_leave_out_what_is_empty() {
+        let dir = Path::new("/home/nico/Área de trabalho/x");
+        assert_eq!(
+            set_rule_args(dir, " Nome ", "48b9c7", true),
+            [
+                "--set-rule",
+                "/home/nico/Área de trabalho/x",
+                "--name",
+                "Nome",
+                "--accent",
+                "#48B9C7",
+                "--subdirs"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        assert_eq!(
+            set_rule_args(dir, "  ", "", false),
+            ["--set-rule", "/home/nico/Área de trabalho/x"].map(std::ffi::OsString::from)
+        );
+    }
+
     fn rule(path: &str, include_subdirs: bool, accent: &str) -> TermDirRule {
         TermDirRule {
             path: path.into(),
             include_subdirs,
             enabled: true,
+            tab_title: None,
             accent: Some(accent.into()),
         }
     }
 
     fn rules(list: Vec<TermDirRule>) -> Vec<ColorRule> {
         color_rules(&TermRules {
-            dir_rules: list.into_iter().enumerate().map(|(i, r)| (i as u64, r)).collect(),
+            dir_rules: list
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| (i as u64, r))
+                .collect(),
         })
     }
 
@@ -358,6 +489,9 @@ mod tests {
             assert!(!out.contains(grey), "{grey} left in {out}");
         }
         assert!(out.contains("#48B9C7"));
-        assert_eq!(recolor_svg(r##"<path fill="#123456"/>"##, Rgb(0, 0, 0)), None);
+        assert_eq!(
+            recolor_svg(r##"<path fill="#123456"/>"##, Rgb(0, 0, 0)),
+            None
+        );
     }
 }

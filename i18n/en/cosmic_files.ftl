@@ -395,3 +395,12 @@ sort-newest-first = Newest first
 sort-oldest-first = Oldest first
 sort-smallest-to-largest = Smallest to largest
 sort-largest-to-smallest = Largest to smallest
+
+# POP Flow: folder rules from the context menu
+folder-rule = Folder rule...
+folder-rule-title = Folder rule
+folder-rule-name = Name
+folder-rule-color = Color
+folder-rule-subdirs = Also apply to subfolders
+folder-rule-remove = Remove rule
+folder-rule-invalid-color = Color must be #rrggbb
