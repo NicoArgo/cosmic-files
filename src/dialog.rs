@@ -1903,6 +1903,23 @@ impl Application for App {
                                 self.auto_scroll_speed = None;
                             }
                         }
+                        // POP Flow: the breadcrumb's "Open in terminal". The
+                        // dialog has no mime cache; the default terminal is
+                        // the system's x-terminal-emulator, else cosmic-term.
+                        tab::Command::OpenInTerminal(path) => {
+                            let terminal = ["x-terminal-emulator", "cosmic-term"]
+                                .into_iter()
+                                .find(|t| {
+                                    env::split_paths(&env::var_os("PATH").unwrap_or_default())
+                                        .any(|dir| dir.join(t).is_file())
+                                })
+                                .unwrap_or("cosmic-term");
+                            let mut command = std::process::Command::new(terminal);
+                            command.current_dir(&path);
+                            if let Err(err) = crate::spawn_detached::spawn_detached(&mut command) {
+                                log::warn!("failed to open {} in {terminal}: {err}", path.display());
+                            }
+                        }
                         unsupported => {
                             log::warn!("{unsupported:?} not supported in dialog mode");
                         }

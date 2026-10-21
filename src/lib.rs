@@ -32,6 +32,7 @@ mod mounter;
 mod mouse_area;
 pub mod operation;
 mod spawn_detached;
+mod terminal_dir;
 pub mod tab;
 mod thumbnail_cacher;
 mod thumbnailer;

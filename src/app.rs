@@ -331,6 +331,7 @@ pub enum NavMenuAction {
     RemoveFromSidebar(segmented_button::Entity),
     OpenInTerminal(segmented_button::Entity),
     FolderRule(segmented_button::Entity),
+    Eject(segmented_button::Entity),
 }
 
 impl MenuAction for NavMenuAction {
@@ -1953,14 +1954,18 @@ impl App {
             );
             let path = child.clone();
             let mut inserted = None;
+            let open = self.nav_expanded.contains(&path);
             nav_model = nav_model.insert(|b| {
-                b.text(name)
+                let b = b
+                    .text(name)
                     .icon(crate::folder_color::tint_symbolic(
                         icon::icon(tab::folder_icon_symbolic(&path, 16)).size(16),
                         &path,
                     ))
                     .data(Location::Path(path))
-                    .with_id(|id| inserted = Some(id))
+                    .with_id(|id| inserted = Some(id));
+                // The "close" slot is the collapse arrow (see `update_nav_model`).
+                if open { b.closable() } else { b }
             });
             if let Some(id) = inserted {
                 indents.push((id, depth));
@@ -1968,6 +1973,30 @@ impl App {
             nav_model = self.insert_nav_children(nav_model, child, depth + 1, indents);
         }
         nav_model
+    }
+
+    /// POP Flow: the default terminal, started in `dir`.
+    fn open_in_terminal(&self, dir: &Path) {
+        let Some(terminal) = self.mime_app_cache.terminal() else {
+            log::warn!("no terminal to open {}", dir.display());
+            return;
+        };
+        let Some(mut command) = terminal
+            .command::<&str>(&[])
+            .and_then(|v| v.into_iter().next())
+        else {
+            log::warn!("failed to get command for {:?}", terminal.id);
+            return;
+        };
+        command.current_dir(dir);
+        if let Err(err) = spawn_detached(&mut command) {
+            log::warn!(
+                "failed to open {} in terminal {:?}: {}",
+                dir.display(),
+                terminal.id,
+                err
+            );
+        }
     }
 
     /// Open or close `path` in the sidebar, scanning its sub-folders the first
@@ -2062,8 +2091,10 @@ impl App {
                     fl!("filesystem")
                 };
                 let child_path = path.clone();
+                let open = self.config.nav_tree && self.nav_expanded.contains(&path);
                 nav_model = nav_model.insert(move |b| {
-                    b.text(name.clone())
+                    let b = b
+                        .text(name.clone())
                         .icon(if path.is_dir() {
                             crate::folder_color::tint_symbolic(
                                 icon::icon(tab::folder_icon_symbolic(&path, 16)).size(16),
@@ -2079,7 +2110,8 @@ impl App {
                             }
                             _ => Location::Path(path.clone()),
                         })
-                        .data(FavoriteIndex(favorite_i))
+                        .data(FavoriteIndex(favorite_i));
+                    if open { b.closable() } else { b }
                 });
                 // Folders opened in the sidebar are listed right below their
                 // favorite, indented; `nav_bar` draws the guide lines itself.
@@ -2138,7 +2170,11 @@ impl App {
                 if let Some(icon) = item.icon(true) {
                     b = b.icon(icon::icon(icon).size(16));
                 }
-                if item.is_mounted() {
+                // POP Flow: the sidebar has one icon for every "close" button.
+                // While a folder is open there it is the collapse arrow, so the
+                // eject buttons step aside until the tree closes (eject stays
+                // in the drive's own menu and in the file manager).
+                if item.is_mounted() && self.nav_expanded.is_empty() {
                     b = b.closable();
                 }
                 if i == 0 {
@@ -2847,7 +2883,16 @@ impl Application for App {
             cosmic::Action::App(Message::NavMenuAction(NavMenuAction::OpenInNewTab(entity)))
         })
         .context_menu(self.nav_context_menu())
-        .close_icon(icon::from_name("media-eject-symbolic").size(16).icon());
+        .close_icon(
+            icon::from_name(if self.nav_expanded.is_empty() {
+                "media-eject-symbolic"
+            } else {
+                // POP Flow: the collapse arrow of an open sidebar folder.
+                "pan-down-symbolic"
+            })
+            .size(16)
+            .icon(),
+        );
 
         #[cfg(feature = "wayland")]
         {
@@ -2909,6 +2954,19 @@ impl Application for App {
                     fl!("open-in-terminal"),
                     None,
                     NavMenuAction::OpenInTerminal(entity),
+                ));
+            }
+            // POP Flow: eject from the menu too — the button beside a drive
+            // gives way to the collapse arrow while a folder is open.
+            if self
+                .nav_model
+                .data::<MounterData>(entity)
+                .is_some_and(|data| data.1.is_mounted())
+            {
+                items.push(cosmic::widget::menu::Item::Button(
+                    fl!("eject"),
+                    None,
+                    NavMenuAction::Eject(entity),
                 ));
             }
             // POP Flow: "Folder rule..." for local sidebar folders.
@@ -4108,43 +4166,31 @@ impl Application for App {
                 }
             },
             Message::OpenTerminal(entity_opt) => {
-                if let Some(terminal) = self.mime_app_cache.terminal() {
-                    let mut paths = Box::from([]);
+                {
+                    let mut paths: Box<[PathBuf]> = Box::from([]);
                     let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
                     if let Some(tab) = self.tab_model.data_mut::<Tab>(entity)
                         && let Some(path) = tab.location.path_opt()
                     {
+                        // POP Flow: each selected item opens where it belongs
+                        // (a file's folder, an executable's repository), one
+                        // terminal per distinct folder.
                         if let Some(items) = tab.items_opt() {
-                            paths = items
-                                .iter()
-                                .filter_map(
-                                    |item| {
-                                        if item.selected { item.path_opt() } else { None }
-                                    },
-                                )
-                                .collect();
+                            paths = crate::terminal_dir::terminal_dirs_for(
+                                items
+                                    .iter()
+                                    .filter(|item| item.selected)
+                                    .filter_map(|item| item.path_opt())
+                                    .map(|p| p.as_path()),
+                            )
+                            .into();
                         }
                         if paths.is_empty() {
-                            paths = Box::from([path]);
+                            paths = Box::from([path.clone()]);
                         }
                     }
-                    for path in paths {
-                        if let Some(mut command) = terminal
-                            .command::<&str>(&[])
-                            .and_then(|v| v.into_iter().next())
-                        {
-                            command.current_dir(path);
-                            if let Err(err) = spawn_detached(&mut command) {
-                                log::warn!(
-                                    "failed to open {} with terminal {:?}: {}",
-                                    path.display(),
-                                    terminal.id,
-                                    err
-                                );
-                            }
-                        } else {
-                            log::warn!("failed to get command for {:?}", terminal.id);
-                        }
+                    for path in &paths {
+                        self.open_in_terminal(path);
                     }
                 }
             }
@@ -5111,6 +5157,7 @@ impl Application for App {
                             commands.push(self.close_context_menus());
                             commands.push(self.open_tab(Location::Path(path), false, None));
                         }
+                        tab::Command::OpenInTerminal(path) => self.open_in_terminal(&path),
                         tab::Command::OpenInNewWindow(path) => match env::current_exe() {
                             Ok(exe) => match process::Command::new(&exe).arg(path).spawn() {
                                 Ok(_child) => {}
@@ -5589,6 +5636,13 @@ impl Application for App {
                 }
             }
             Message::NavBarClose(entity) => {
+                // POP Flow: on an open sidebar folder this is the collapse arrow.
+                if let Some(Location::Path(path)) = self.nav_model.data::<Location>(entity)
+                    && self.nav_expanded.contains(path)
+                {
+                    let path = path.clone();
+                    return self.toggle_nav_expand(path);
+                }
                 if let Some(data) = self.nav_model.data::<MounterData>(entity)
                     && let Some(mounter) = MOUNTERS.get(&data.0)
                 {
@@ -5633,6 +5687,15 @@ impl Application for App {
                         return self.open_file(&[path]);
                     }
                 }
+                NavMenuAction::Eject(entity) => {
+                    if let Some(data) = self.nav_model.data::<MounterData>(entity)
+                        && let Some(mounter) = MOUNTERS.get(&data.0)
+                    {
+                        return mounter
+                            .unmount(data.1.clone())
+                            .map(|()| cosmic::action::none());
+                    }
+                }
                 NavMenuAction::OpenInTerminal(entity) => {
                     // POP Flow: open the default terminal at the sidebar folder,
                     // reusing the same terminal lookup as Message::OpenTerminal.
@@ -5641,21 +5704,8 @@ impl Application for App {
                         .data::<Location>(entity)
                         .and_then(Location::path_opt)
                         .cloned();
-                    if let Some(path) = path_opt
-                        && let Some(terminal) = self.mime_app_cache.terminal()
-                        && let Some(mut command) = terminal
-                            .command::<&str>(&[])
-                            .and_then(|v| v.into_iter().next())
-                    {
-                        command.current_dir(&path);
-                        if let Err(err) = spawn_detached(&mut command) {
-                            log::warn!(
-                                "failed to open {} in terminal {:?}: {}",
-                                path.display(),
-                                terminal.id,
-                                err
-                            );
-                        }
+                    if let Some(path) = path_opt {
+                        self.open_in_terminal(&path);
                     }
                 }
                 NavMenuAction::FolderRule(entity) => {

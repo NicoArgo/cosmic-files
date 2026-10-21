@@ -13,6 +13,7 @@ use cosmic::{Element, theme};
 use i18n_embed::LanguageLoader;
 use mime_guess::Mime;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use crate::app::{Action, Message};
@@ -138,10 +139,14 @@ pub fn context_menu<'a>(
     let mut selected_types: Vec<Mime> = vec![];
     let mut selected_mount_point = 0;
     let mut any_trash_item = false;
+    let mut selected_paths: Vec<&Path> = Vec::new();
     if let Some(items) = tab.items_opt() {
         for item in items {
             if item.selected {
                 selected += 1;
+                if let Some(path) = item.path_opt() {
+                    selected_paths.push(path);
+                }
                 if item.metadata.is_dir() {
                     selected_mount_point += i32::from(item.is_mount_point);
                     selected_dir += 1;
@@ -168,6 +173,15 @@ pub fn context_menu<'a>(
     selected_types.sort_unstable();
     selected_types.dedup();
     selected_trash_only = selected_trash_only && selected == 1;
+    // POP Flow: "Open in terminal" for anything that maps to exactly one
+    // folder — a folder, a file's folder, an executable's repository. Never
+    // one terminal per item. Capped so a huge selection doesn't stat it all
+    // on every redraw.
+    let one_terminal_dir = !any_trash_item
+        && selected > 0
+        && selected <= 64
+        && selected_paths.len() == selected
+        && crate::terminal_dir::terminal_dirs_for(selected_paths.iter().copied()).len() == 1;
     let context_action_items = |selected: usize, selected_dir: usize| {
         context_actions
             .iter()
@@ -213,6 +227,9 @@ pub fn context_menu<'a>(
                         |(i, action)| menu_item(action.name, Action::ExecEntryAction(i)).into(),
                     ));
                 }
+                if one_terminal_dir {
+                    children.push(menu_item(fl!("open-in-terminal"), Action::OpenTerminal).into());
+                }
                 children.push(divider::horizontal::light().into());
                 children.push(menu_item(fl!("rename"), Action::Rename).into());
                 children.push(menu_item(fl!("cut"), Action::Cut).into());
@@ -233,10 +250,9 @@ pub fn context_menu<'a>(
                 }
                 if selected == 1 {
                     children.push(menu_item(fl!("menu-open-with"), Action::OpenWith).into());
-                    if selected_dir == 1 {
-                        children
-                            .push(menu_item(fl!("open-in-terminal"), Action::OpenTerminal).into());
-                    }
+                }
+                if one_terminal_dir {
+                    children.push(menu_item(fl!("open-in-terminal"), Action::OpenTerminal).into());
                 }
                 if tab.location.is_recents() || matches!(tab.location, Location::Search(..)) {
                     children.push(
@@ -838,6 +854,12 @@ pub fn location_context_menu<'a>(ancestor_index: usize) -> Element<'a, tab::Mess
         menu_button!(text::body(fl!("open-in-new-window")))
             .on_press(tab::Message::LocationMenuAction(
                 LocationMenuAction::OpenInNewWindow(ancestor_index),
+            ))
+            .into(),
+        // POP Flow
+        menu_button!(text::body(fl!("open-in-terminal")))
+            .on_press(tab::Message::LocationMenuAction(
+                LocationMenuAction::OpenInTerminal(ancestor_index),
             ))
             .into(),
         divider::horizontal::light().into(),

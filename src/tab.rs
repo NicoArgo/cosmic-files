@@ -1799,6 +1799,8 @@ pub enum Command {
     OpenFile(Vec<PathBuf>),
     OpenInNewTab(PathBuf),
     OpenInNewWindow(PathBuf),
+    /// POP Flow: open the default terminal in this folder.
+    OpenInTerminal(PathBuf),
     OpenTrash,
     Preview(PreviewKind),
     RunContextAction(usize),
@@ -1880,6 +1882,8 @@ pub enum Message {
     DndMotion(f64, f64),
     /// POP Flow: an animation frame for the desktop's hover scale.
     HoverFrame(Instant),
+    /// POP Flow: a frame of the scrolling while a drag rests at an edge.
+    DndEdgeTick(Instant),
     WindowDrag,
     WindowToggleMaximize,
     ZoomIn,
@@ -1897,6 +1901,8 @@ pub enum Message {
 pub enum LocationMenuAction {
     OpenInNewTab(usize),
     OpenInNewWindow(usize),
+    /// POP Flow: a terminal at that segment of the path.
+    OpenInTerminal(usize),
     Preview(usize),
     AddToSidebar(usize),
 }
@@ -2962,6 +2968,46 @@ pub struct Tab {
     dnd_point: Option<Point>,
     /// POP Flow: time of the previous hover-scale frame.
     hover_frame: Option<Instant>,
+    /// POP Flow: scrolling because a drag is near the top or bottom edge.
+    dnd_edge: Option<DndEdge>,
+}
+
+/// POP Flow: a drag held near an edge of the item view keeps it scrolling, also
+/// with the pointer still — that is when the intent is clearest.
+#[derive(Clone, Copy, Debug)]
+struct DndEdge {
+    /// Pixels per second; negative scrolls up.
+    speed: f32,
+    /// When the pointer reached the edge zone, to speed up while it stays.
+    since: Instant,
+    /// Previous frame.
+    last_tick: Option<Instant>,
+    /// The drag left the tab's drop area. Moving onto a folder inside it looks
+    /// the same at first (that folder is its own drop area), so this only
+    /// stops the scrolling if no folder claims the drag shortly after.
+    left_at: Option<Instant>,
+}
+
+/// POP Flow: how deep into an edge zone counts, in pixels.
+const DND_EDGE_ZONE: f32 = 64.0;
+
+/// POP Flow: scroll speed for a drag at `y`, with the item view spanning
+/// `top..bottom`: slow on entering the zone, fast against the edge (past it,
+/// over the path bar, counts as against it). Zero outside the zones.
+fn dnd_edge_speed(y: f32, top: f32, bottom: f32) -> f32 {
+    const MIN: f32 = 120.0;
+    const MAX: f32 = 1500.0;
+    if bottom - top < DND_EDGE_ZONE * 3.0 {
+        return 0.0;
+    }
+    let depth = if y > bottom - DND_EDGE_ZONE {
+        ((y - (bottom - DND_EDGE_ZONE)) / DND_EDGE_ZONE).min(1.0)
+    } else if y < top + DND_EDGE_ZONE {
+        -(((top + DND_EDGE_ZONE) - y) / DND_EDGE_ZONE).min(1.0)
+    } else {
+        return 0.0;
+    };
+    depth.signum() * (MIN + (MAX - MIN) * depth * depth)
 }
 
 async fn calculate_dir_size(path: &Path, controller: Controller) -> Result<u64, OperationError> {
@@ -3115,7 +3161,47 @@ impl Tab {
             desktop_geometry: Cell::new(None),
             dnd_point: None,
             hover_frame: None,
+            dnd_edge: None,
         }
+    }
+
+    /// POP Flow: start, steer or stop the edge scrolling of a drag.
+    fn set_dnd_edge(&mut self, speed: f32) {
+        if speed == 0.0 {
+            self.dnd_edge = None;
+            return;
+        }
+        match self.dnd_edge.as_mut() {
+            // Same edge: keep the time held there, so it keeps speeding up.
+            Some(edge) if edge.speed.signum() == speed.signum() => {
+                edge.speed = speed;
+                edge.left_at = None;
+            }
+            _ => {
+                self.dnd_edge = Some(DndEdge {
+                    speed,
+                    since: Instant::now(),
+                    last_tick: None,
+                    left_at: None,
+                });
+            }
+        }
+    }
+
+    /// POP Flow: edge speed for a drag over the folder at `location`, from
+    /// where its row sits in the visible part of the view.
+    fn dnd_edge_speed_at_item(&self, location: &Location) -> Option<f32> {
+        let view = self.item_view_size_opt.get()?;
+        let rect = self
+            .items_opt
+            .as_ref()?
+            .iter()
+            .find(|item| item.location_opt.as_ref() == Some(location))?
+            .rect_opt
+            .get()?;
+        let scroll_y = self.scroll_opt.map_or(0.0, |o| o.y);
+        let center = rect.y + rect.height / 2.0 - scroll_y;
+        Some(dnd_edge_speed(center, 0.0, view.height))
     }
 
     pub fn title(&self) -> String {
@@ -4130,6 +4216,11 @@ impl Tab {
                             commands.push(Command::OpenInNewWindow(path));
                         }
                     }
+                    LocationMenuAction::OpenInTerminal(ancestor_index) => {
+                        if let Some(path) = path_for_index(ancestor_index) {
+                            commands.push(Command::OpenInTerminal(path));
+                        }
+                    }
                     LocationMenuAction::Preview(ancestor_index) => {
                         if let Some(path) = path_for_index(ancestor_index) {
                             //TODO: blocking code, run in command
@@ -5068,6 +5159,7 @@ impl Tab {
             }
             Message::Drop(Some((to, mut from))) => {
                 self.dnd_hovered = None;
+                self.dnd_edge = None;
                 // POP Flow: desktop icons dropped back on the desktop are being
                 // arranged, not copied — move them to the cell under the drop.
                 if let Location::Desktop(dir, output, _) = &to
@@ -5105,6 +5197,7 @@ impl Tab {
             }
             Message::Drop(None) => {
                 self.dnd_hovered = None;
+                self.dnd_edge = None;
             }
             Message::DndHover(loc) => {
                 if self
@@ -5117,6 +5210,16 @@ impl Tab {
             }
             Message::DndEnter(loc) => {
                 self.dnd_hovered = Some((loc.clone(), Instant::now()));
+                // A folder inside the view took the drag: still here. Its row
+                // tells roughly where the pointer is, for the edge scrolling.
+                if loc != self.location {
+                    if let Some(edge) = self.dnd_edge.as_mut() {
+                        edge.left_at = None;
+                    }
+                    if let Some(speed) = self.dnd_edge_speed_at_item(&loc) {
+                        self.set_dnd_edge(speed);
+                    }
+                }
                 if loc != self.location {
                     commands.push(Command::Iced(
                         cosmic::Task::future(async move {
@@ -5150,21 +5253,40 @@ impl Tab {
                 }
             }
             Message::DndMotion(x, y) => {
+                let (x, y) = (x as f32, y as f32);
                 if matches!(self.mode, Mode::Desktop) {
-                    let (x, y) = (x as f32, y as f32);
                     self.dnd_point = Some(Point::new(x, y));
-                    // Near the top or bottom edge, scroll: dragging an icon to
-                    // the bottom reveals the empty row kept below the last one,
-                    // and keeps going for as long as the pointer moves there.
-                    const EDGE: f32 = 56.0;
-                    const STEP: f32 = 36.0;
-                    let scrolled = self.scroll_opt.is_some_and(|o| o.y > 0.0);
-                    let dy = match self.size_opt.get() {
-                        Some(size) if y > size.height - EDGE => STEP,
-                        Some(_) if y < EDGE && scrolled => -STEP,
-                        _ => 0.0,
+                }
+                // Near the top or bottom edge, scroll — and keep scrolling while
+                // the drag stays there (`DndEdgeTick`). On the desktop that
+                // reveals the empty row kept below the last icon.
+                if let Some(size) = self.size_opt.get() {
+                    let top = match self.mode {
+                        Mode::Desktop => 0.0,
+                        _ => self
+                            .item_view_size_opt
+                            .get()
+                            .map_or(0.0, |view| (size.height - view.height).max(0.0)),
                     };
-                    if dy != 0.0 {
+                    self.set_dnd_edge(dnd_edge_speed(y, top, size.height));
+                }
+            }
+            Message::DndEdgeTick(now) => {
+                if let Some(edge) = self.dnd_edge.as_mut() {
+                    if edge
+                        .left_at
+                        .is_some_and(|at| now.duration_since(at) > Duration::from_millis(250))
+                    {
+                        self.dnd_edge = None;
+                    } else {
+                        let dt = edge
+                            .last_tick
+                            .map_or(1.0 / 60.0, |last| now.duration_since(last).as_secs_f32())
+                            .min(1.0 / 20.0);
+                        edge.last_tick = Some(now);
+                        // Up to twice as fast after two seconds at the edge.
+                        let held = now.duration_since(edge.since).as_secs_f32().min(2.0);
+                        let dy = edge.speed * (1.0 + held / 2.0) * dt;
                         commands.push(Command::Iced(
                             scrollable::scroll_by(
                                 self.scrollable_id.clone(),
@@ -5178,6 +5300,11 @@ impl Tab {
             Message::DndLeave(loc) => {
                 if Some(&loc) == self.dnd_hovered.as_ref().map(|(l, _)| l) {
                     self.dnd_hovered = None;
+                }
+                if loc == self.location
+                    && let Some(edge) = self.dnd_edge.as_mut()
+                {
+                    edge.left_at = Some(Instant::now());
                 }
             }
             Message::WindowDrag => {
@@ -8098,6 +8225,13 @@ impl Tab {
             ));
         }
 
+        // POP Flow: frames while a drag holds the view scrolling at an edge.
+        if self.dnd_edge.is_some() {
+            subscriptions.push(
+                cosmic::iced::window::frames().map(|(_, at)| Message::DndEdgeTick(at)),
+            );
+        }
+
         // POP Flow: frames only while a desktop icon is growing or shrinking.
         if matches!(self.mode, Mode::Desktop)
             && self
@@ -8252,7 +8386,8 @@ mod tests {
 
     use super::{
         Command, HeadingOptions, ItemMetadata, ItemThumbnail, Location, Message, Tab, View,
-        desktop_name_lines, respond_to_scroll_direction, scan_path, scroll_thumb,
+        DND_EDGE_ZONE, desktop_name_lines, dnd_edge_speed, respond_to_scroll_direction, scan_path,
+        scroll_thumb,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -9053,5 +9188,24 @@ mod tests {
         let cached = start.elapsed() / RUNS;
         println!("{rows} rows: sorted {uncached:?}, cached {cached:?} per call");
         Ok(())
+    }
+
+    #[test]
+    fn dnd_edge_speed_grows_toward_the_edges() {
+        let (top, bottom) = (100.0, 700.0);
+        // The middle never scrolls.
+        assert_eq!(dnd_edge_speed(400.0, top, bottom), 0.0);
+        assert_eq!(dnd_edge_speed(top + DND_EDGE_ZONE + 1.0, top, bottom), 0.0);
+        // Down: entering slow, against the edge fast, past it no faster.
+        let entering = dnd_edge_speed(bottom - DND_EDGE_ZONE + 4.0, top, bottom);
+        let deep = dnd_edge_speed(bottom - 4.0, top, bottom);
+        assert!(entering > 0.0 && deep > entering * 4.0);
+        assert_eq!(dnd_edge_speed(bottom + 50.0, top, bottom), dnd_edge_speed(bottom, top, bottom));
+        // Up is the mirror image, and over the path bar counts as the edge.
+        let up = dnd_edge_speed(top + 4.0, top, bottom);
+        assert!((up + deep).abs() < 1.0);
+        assert_eq!(dnd_edge_speed(10.0, top, bottom), dnd_edge_speed(top - DND_EDGE_ZONE, top, bottom));
+        // A view too short to have a middle doesn't scroll by itself.
+        assert_eq!(dnd_edge_speed(150.0, 100.0, 250.0), 0.0);
     }
 }
